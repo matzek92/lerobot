@@ -112,3 +112,18 @@ class IntelRealSenseCameraConfig(CameraConfig):
 
         if self.rotation not in [-90, None, 90, 180]:
             raise ValueError(f"`rotation` must be in [-90, None, 90, 180] (got {self.rotation})")
+
+
+
+@CameraConfig.register_subclass("imagezmq")
+@dataclass
+class ImageZMQCameraConfig(CameraConfig):
+    """"""
+
+    hostname: str
+    port: int
+    fps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    channels: int = 3
+    mock: bool = False

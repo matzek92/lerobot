@@ -296,6 +296,7 @@ def record(
             break
 
         log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        print("\033[31mSTART\033[0m")
         record_episode(
             robot=robot,
             dataset=dataset,
