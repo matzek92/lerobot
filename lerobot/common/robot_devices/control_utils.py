@@ -37,8 +37,9 @@ from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import get_safe_torch_device, has_method
 
-
+log_counter = 0
 def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, fps=None):
+    global log_counter
     log_items = []
     if episode_index is not None:
         log_items.append(f"ep:{episode_index}")
@@ -79,7 +80,9 @@ def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, f
                 log_dt(f"dtR{name}", robot.logs[key])
 
     info_str = " ".join(log_items)
-    logging.info(info_str)
+    if log_counter % 180 == 0:
+        logging.info(info_str)
+    log_counter += 1
 
 
 @cache
