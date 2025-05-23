@@ -316,7 +316,7 @@ def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:
     return repo_versions
 
 
-def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> str:
+def get_safe_version(repo_id: str, version: str | packaging.version.Version, offline: bool = True) -> str:
     """
     Returns the version if available on repo or the latest compatible one.
     Otherwise, will throw a `CompatibilityError`.
@@ -324,6 +324,10 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     target_version = (
         packaging.version.parse(version) if not isinstance(version, packaging.version.Version) else version
     )
+
+    if offline:
+        return f"v{target_version}"
+
     hub_versions = get_repo_versions(repo_id)
 
     if not hub_versions:

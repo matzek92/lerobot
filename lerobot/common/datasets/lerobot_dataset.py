@@ -84,6 +84,7 @@ class LeRobotDatasetMetadata:
         root: str | Path | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
+        offline: bool = False
     ):
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
@@ -98,7 +99,8 @@ class LeRobotDatasetMetadata:
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
             (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
+            if not offline:
+                self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
     def load_metadata(self):
@@ -364,6 +366,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        offline: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:

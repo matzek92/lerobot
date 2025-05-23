@@ -47,9 +47,9 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
         # Transpose from pytorch convention (C, H, W) to (H, W, C)
         image_array = image_array.transpose(1, 2, 0)
 
-    elif image_array.shape[-1] != 3:
+    elif image_array.shape[-1] not in (1, 3):
         raise NotImplementedError(
-            f"The image has {image_array.shape[-1]} channels, but 3 is required for now."
+            f"The image has {image_array.shape[-1]} channels, but 1 or 3 is required for now."
         )
 
     if image_array.dtype != np.uint8:
@@ -64,8 +64,12 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
                 )
 
         image_array = (image_array * 255).astype(np.uint8)
-
-    return PIL.Image.fromarray(image_array)
+        if image_array.shape[-1] == 3:
+            return PIL.Image.fromarray(image_array)
+        elif image_array.shape[-1] == 1:
+            image_array = np.repeat(image_array, 3, axis=2)
+            return PIL.Image.fromarray(image_array)
+        raise RuntimeError("Could not build image")
 
 
 def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path):
