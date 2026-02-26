@@ -77,7 +77,12 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 
-from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from .joint_observations_processor import (
+    JointVelocityProcessorStep,
+    MotorCurrentProcessorStep,
+    ZmqObservationProcessorStep,
+    ZmqSensorConfig,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -413,6 +418,11 @@ def make_processors(
             env_pipeline_steps.append(JointVelocityProcessorStep(dt=1.0 / cfg.fps))
         if cfg.processor.observation.add_current_to_observation:
             env_pipeline_steps.append(MotorCurrentProcessorStep(robot=env.robot))
+        if cfg.processor.observation.zmq_sensor_subscriptions:
+            zmq_configs = [
+                ZmqSensorConfig(**sub) for sub in cfg.processor.observation.zmq_sensor_subscriptions
+            ]
+            env_pipeline_steps.append(ZmqObservationProcessorStep(zmq_configs=zmq_configs))
 
     add_ee_pose = (
         cfg.processor.observation is not None and cfg.processor.observation.add_ee_pose_to_observation

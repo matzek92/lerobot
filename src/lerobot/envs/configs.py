@@ -207,6 +207,21 @@ class ObservationConfig:
     add_current_to_observation: bool = False
     add_ee_pose_to_observation: bool = False
     display_cameras: bool = False
+    zmq_sensor_subscriptions: list | None = None
+    """List of ZMQ sensor subscription configs.
+
+    Each entry is a dict with keys ``address`` (str), ``port`` (int),
+    ``feature_dim`` (int) and optionally ``timeout_ms`` (int).  The features
+    received from these publishers are appended to ``observation.state`` in the
+    order they appear in the list.
+
+    Example YAML::
+
+        zmq_sensor_subscriptions:
+          - address: "127.0.0.1"
+            port: 5600
+            feature_dim: 3
+    """
 
 
 @dataclass
