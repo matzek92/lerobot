@@ -25,7 +25,10 @@ from .configs import CameraConfig, Cv2Rotation
 def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[str, Camera]:
     cameras: dict[str, Camera] = {}
 
-    for key, cfg in camera_configs.items():
+    # Process non-virtual cameras first so that virtual cameras can reference them.
+    ordered_items = sorted(camera_configs.items(), key=lambda kv: kv[1].type == "virtual")
+
+    for key, cfg in ordered_items:
         # TODO(Steven): Consider just using the make_device_from_device_class for all types
         if cfg.type == "opencv":
             from .opencv import OpenCVCamera
@@ -46,6 +49,19 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
             from .zmq.camera_zmq import ZMQCamera
 
             cameras[key] = ZMQCamera(cfg)
+
+        elif cfg.type == "virtual":
+            from .virtual import VirtualCamera
+            from .virtual.configuration_virtual import VirtualCameraConfig
+
+            virtual_cfg = cast(VirtualCameraConfig, cfg)
+            source_key = virtual_cfg.camera_key
+            if source_key not in cameras:
+                raise ValueError(
+                    f"Virtual camera '{key}' references source camera '{source_key}', "
+                    f"which is not present in the camera configs."
+                )
+            cameras[key] = VirtualCamera(virtual_cfg, cameras[source_key])
 
         else:
             try:

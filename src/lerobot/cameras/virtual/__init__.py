@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .camera import Camera
-from .configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation
-from .utils import make_cameras_from_configs
-from .virtual import VirtualCamera, VirtualCameraConfig
+from .camera_virtual import VirtualCamera
+from .configuration_virtual import VirtualCameraConfig
+
+__all__ = ["VirtualCamera", "VirtualCameraConfig"]
