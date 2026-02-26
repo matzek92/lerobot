@@ -43,7 +43,7 @@ def encode_image(image: np.ndarray, quality: int = 80) -> str:
 
 
 class ImageServer:
-    def __init__(self, config: dict, port: int = 5555):
+    def __init__(self, config: dict, port: int = 5555, event_port: int | None = None):
         self.fps = config.get("fps", 30)
         self.cameras: dict[str, OpenCVCamera] = {}
 
@@ -68,7 +68,31 @@ class ImageServer:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.bind(f"tcp://*:{port}")
 
+        # Optional ZMQ PULL socket for receiving recording event notifications
+        self.event_socket: zmq.Socket | None = None
+        if event_port is not None:
+            self.event_socket = self.context.socket(zmq.PULL)
+            self.event_socket.setsockopt(zmq.LINGER, 0)
+            self.event_socket.bind(f"tcp://*:{event_port}")
+            logger.info(f"ImageServer event listener on port {event_port}")
+
         logger.info(f"ImageServer running on port {port}")
+
+    def _handle_events(self) -> None:
+        """Process any pending recording event notifications (non-blocking)."""
+        if self.event_socket is None:
+            return
+        while True:
+            try:
+                message = self.event_socket.recv_string(zmq.NOBLOCK)
+                data = json.loads(message)
+                event_type = data.get("event", "unknown")
+                logger.info(f"Received recording event: {event_type}")
+            except zmq.Again:
+                break
+            except Exception as e:
+                logger.warning(f"Error handling recording event: {e}")
+                break
 
     def run(self):
         frame_count = 0
@@ -89,6 +113,8 @@ class ImageServer:
                 with contextlib.suppress(zmq.Again):
                     self.socket.send_string(json.dumps(message), zmq.NOBLOCK)
 
+                self._handle_events()
+
                 frame_count += 1
                 frame_times.append(time.time() - t0)
 
@@ -104,6 +130,8 @@ class ImageServer:
         finally:
             for cam in self.cameras.values():
                 cam.disconnect()
+            if self.event_socket is not None:
+                self.event_socket.close()
             self.socket.close()
             self.context.term()
 

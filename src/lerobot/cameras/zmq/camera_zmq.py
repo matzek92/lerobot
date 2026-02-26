@@ -87,6 +87,7 @@ class ZMQCamera(Camera):
         # ZMQ Context and Socket
         self.context: zmq.Context | None = None
         self.socket: zmq.Socket | None = None
+        self.event_socket: zmq.Socket | None = None
         self._connected = False
 
         # Threading resources
@@ -127,6 +128,13 @@ class ZMQCamera(Camera):
             self.socket.connect(f"tcp://{self.server_address}:{self.port}")
             self._connected = True
 
+            # Set up event notification socket if event_port is configured
+            if self.config.event_port is not None:
+                self.event_socket = self.context.socket(zmq.PUSH)
+                self.event_socket.setsockopt(zmq.LINGER, 0)
+                self.event_socket.connect(f"tcp://{self.server_address}:{self.config.event_port}")
+                logger.info(f"{self} event notifications enabled on port {self.config.event_port}")
+
             # Auto-detect resolution if not provided
             if self.width is None or self.height is None:
                 # Read directly from hardware because the thread isn't running yet
@@ -157,6 +165,9 @@ class ZMQCamera(Camera):
     def _cleanup(self):
         """Clean up ZMQ resources."""
         self._connected = False
+        if self.event_socket:
+            self.event_socket.close()
+            self.event_socket = None
         if self.socket:
             self.socket.close()
             self.socket = None
@@ -170,6 +181,27 @@ class ZMQCamera(Camera):
         Detection not implemented for ZMQ cameras. These cameras require manual configuration (server address/port).
         """
         raise NotImplementedError("Camera detection is not implemented for ZMQ cameras.")
+
+    def send_event(self, event_type: str) -> None:
+        """Send a recording event notification to the camera server.
+
+        Sends a JSON message with the event type and current timestamp to the camera server
+        via the ZMQ PUSH socket. Only active when `event_port` is configured.
+
+        Args:
+            event_type (str): The event type, e.g. ``"episode_start"``, ``"episode_end"``,
+                ``"reset_done"``.
+        """
+        if self.event_socket is None:
+            return
+        try:
+            import zmq
+
+            message = json.dumps({"event": event_type, "timestamp": time.time()})
+            self.event_socket.send_string(message, zmq.NOBLOCK)
+            logger.debug(f"{self} sent event: {event_type}")
+        except Exception as e:
+            logger.warning(f"{self} failed to send event '{event_type}': {e}")
 
     def _read_from_hardware(self) -> NDArray[Any]:
         """

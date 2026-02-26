@@ -148,6 +148,22 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
+def _notify_zmq_cameras(robot: Robot, event_type: str) -> None:
+    """Send a recording event notification to all connected ZMQ cameras.
+
+    Args:
+        robot: The robot whose cameras are checked.
+        event_type: Event name, e.g. ``"episode_start"``, ``"episode_end"``, ``"reset_done"``.
+    """
+    from lerobot.cameras.zmq import ZMQCamera
+
+    if not hasattr(robot, "cameras"):
+        return
+    for cam in robot.cameras.values():
+        if isinstance(cam, ZMQCamera):
+            cam.send_event(event_type)
+
+
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -527,6 +543,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                _notify_zmq_cameras(robot, "episode_start")
                 record_loop(
                     robot=robot,
                     events=events,
@@ -544,6 +561,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
+                _notify_zmq_cameras(robot, "episode_end")
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
@@ -568,6 +586,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
+                    _notify_zmq_cameras(robot, "reset_done")
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

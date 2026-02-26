@@ -30,6 +30,11 @@ class ZMQCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     timeout_ms: int = 5000
     warmup_s: int = 1
+    # Optional port for sending recording event notifications to the camera server.
+    # If set, ZMQCamera will push events (episode_start, episode_end, reset_done) to
+    # tcp://{server_address}:{event_port}. The ImageServer must be started with the
+    # same event_port to receive them.
+    event_port: int | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -42,3 +47,8 @@ class ZMQCameraConfig(CameraConfig):
 
         if self.port <= 0 or self.port > 65535:
             raise ValueError(f"`port` must be between 1 and 65535, but {self.port} is provided.")
+
+        if self.event_port is not None and (self.event_port <= 0 or self.event_port > 65535):
+            raise ValueError(
+                f"`event_port` must be between 1 and 65535, but {self.event_port} is provided."
+            )
