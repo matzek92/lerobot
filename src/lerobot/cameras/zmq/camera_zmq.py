@@ -107,6 +107,7 @@ class ZMQCamera(Camera):
         self.context: zmq.Context | None = None
         self.socket: zmq.Socket | None = None
         self.event_socket: zmq.Socket | None = None
+        self.features_socket: zmq.Socket | None = None
         self._connected = False
 
         # Threading resources
@@ -154,6 +155,13 @@ class ZMQCamera(Camera):
                 self.event_socket.connect(f"tcp://{self.server_address}:{self.config.event_port}")
                 logger.info(f"{self} event notifications enabled on port {self.config.event_port}")
 
+            # Set up features socket if features_port is configured
+            if self.config.features_port is not None:
+                self.features_socket = self.context.socket(zmq.PUSH)
+                self.features_socket.setsockopt(zmq.LINGER, 0)
+                self.features_socket.connect(f"tcp://{self.server_address}:{self.config.features_port}")
+                logger.info(f"{self} features stream enabled on port {self.config.features_port}")
+
             # Auto-detect resolution if not provided
             if self.width is None or self.height is None:
                 # Read directly from hardware because the thread isn't running yet
@@ -184,6 +192,9 @@ class ZMQCamera(Camera):
     def _cleanup(self):
         """Clean up ZMQ resources."""
         self._connected = False
+        if self.features_socket:
+            self.features_socket.close()
+            self.features_socket = None
         if self.event_socket:
             self.event_socket.close()
             self.event_socket = None
@@ -221,6 +232,29 @@ class ZMQCamera(Camera):
             logger.debug(f"{self} sent event: {event_type}")
         except Exception as e:
             logger.warning(f"{self} failed to send event '{event_type}': {e}")
+
+    def send_features(self, features: dict) -> None:
+        """Send robot features and sensor readings to the camera server.
+
+        Sends a JSON message containing robot features (e.g. joint positions,
+        velocities, sensor readings) to the camera server via the ZMQ PUSH socket.
+        The server can use these features for camera image preprocessing. Only active
+        when ``features_port`` is configured.
+
+        Args:
+            features (dict): Dictionary of robot features and sensor readings, e.g.
+                ``{"joint_positions": [...], "timestamp": 1234.5}``.
+        """
+        if self.features_socket is None:
+            return
+        try:
+            import zmq
+
+            message = json.dumps({"features": features, "timestamp": time.time()})
+            self.features_socket.send_string(message, zmq.NOBLOCK)
+            logger.debug(f"{self} sent features")
+        except Exception as e:
+            logger.warning(f"{self} failed to send features: {e}")
 
     def _read_from_hardware(self) -> NDArray[Any]:
         """

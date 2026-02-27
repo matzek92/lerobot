@@ -186,6 +186,180 @@ class TestNotifyZMQCameras:
         self._notify_zmq_cameras(mock_robot, "reset_done")
 
 
+class TestZMQCameraFeaturesConfig:
+    def test_features_port_default_is_none(self):
+        config = ZMQCameraConfig(server_address="127.0.0.1")
+        assert config.features_port is None
+
+    def test_features_port_valid(self):
+        config = ZMQCameraConfig(server_address="127.0.0.1", features_port=5557)
+        assert config.features_port == 5557
+
+    def test_features_port_invalid_zero(self):
+        with pytest.raises(ValueError, match="features_port"):
+            ZMQCameraConfig(server_address="127.0.0.1", features_port=0)
+
+    def test_features_port_invalid_too_large(self):
+        with pytest.raises(ValueError, match="features_port"):
+            ZMQCameraConfig(server_address="127.0.0.1", features_port=99999)
+
+
+class TestZMQCameraSendFeatures:
+    def test_send_features_no_op_without_features_port(self):
+        """send_features should silently do nothing when features_port is not configured."""
+        camera = _make_camera()
+        assert camera.features_socket is None
+        # Should not raise
+        camera.send_features({"joint_positions": [0.0, 1.0]})
+
+    def test_send_features_sends_json_with_features(self):
+        """send_features should push a JSON message containing the features dict."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        camera.features_socket = mock_socket
+
+        features = {"joint_positions": [0.1, 0.2, 0.3], "gripper": 0.5}
+        camera.send_features(features)
+
+        mock_socket.send_string.assert_called_once()
+        sent_message = mock_socket.send_string.call_args[0][0]
+        data = json.loads(sent_message)
+        assert data["features"] == features
+        assert "timestamp" in data
+
+    def test_send_features_includes_timestamp(self):
+        """send_features should include a float timestamp close to the current time."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        camera.features_socket = mock_socket
+
+        before = time.time()
+        camera.send_features({"sensor": 42.0})
+        after = time.time()
+
+        sent_message = mock_socket.send_string.call_args[0][0]
+        data = json.loads(sent_message)
+        assert before <= data["timestamp"] <= after
+
+    def test_send_features_suppresses_zmq_errors(self):
+        """send_features should log a warning instead of raising on ZMQ errors."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        mock_socket.send_string.side_effect = RuntimeError("zmq error")
+        camera.features_socket = mock_socket
+
+        # Should not raise
+        camera.send_features({"joint_positions": [0.0]})
+
+    def test_features_socket_created_when_features_port_configured(self):
+        """features_socket should be assignable when features_port is configured."""
+        config = ZMQCameraConfig(server_address="127.0.0.1", features_port=5557)
+        camera = ZMQCamera(config)
+        mock_push_socket = MagicMock()
+        camera.features_socket = mock_push_socket
+        assert camera.features_socket is mock_push_socket
+
+    def test_no_features_socket_without_features_port(self):
+        """features_socket should be None when features_port is not configured."""
+        camera = _make_camera()
+        assert camera.features_socket is None
+
+
+class TestSendFeaturesToZMQCameras:
+    """Tests for lerobot_record._send_features_to_zmq_cameras."""
+
+    def setup_method(self):
+        from lerobot.scripts.lerobot_record import _send_features_to_zmq_cameras
+
+        self._send_features_to_zmq_cameras = _send_features_to_zmq_cameras
+
+    def test_sends_scalar_observations_to_zmq_cameras(self):
+        """Non-image observations should be forwarded to ZMQ cameras."""
+        import numpy as np
+
+        zmq_cam = _make_camera()
+        zmq_cam.send_features = MagicMock()
+
+        mock_robot = MagicMock()
+        mock_robot.cameras = {"head": zmq_cam}
+
+        obs = {"shoulder_pan.pos": 0.5, "gripper.pos": 1.0}
+        self._send_features_to_zmq_cameras(mock_robot, obs)
+
+        zmq_cam.send_features.assert_called_once_with({"shoulder_pan.pos": 0.5, "gripper.pos": 1.0})
+
+    def test_excludes_image_arrays_from_features(self):
+        """2-D+ numpy arrays (images) should not be included in sent features."""
+        import numpy as np
+
+        zmq_cam = _make_camera()
+        zmq_cam.send_features = MagicMock()
+
+        mock_robot = MagicMock()
+        mock_robot.cameras = {"head": zmq_cam}
+
+        obs = {
+            "shoulder_pan.pos": 0.5,
+            "head_camera": np.zeros((480, 640, 3), dtype=np.uint8),
+        }
+        self._send_features_to_zmq_cameras(mock_robot, obs)
+
+        called_features = zmq_cam.send_features.call_args[0][0]
+        assert "shoulder_pan.pos" in called_features
+        assert "head_camera" not in called_features
+
+    def test_converts_1d_numpy_arrays_to_lists(self):
+        """1-D numpy arrays (state vectors) should be converted to Python lists."""
+        import numpy as np
+
+        zmq_cam = _make_camera()
+        zmq_cam.send_features = MagicMock()
+
+        mock_robot = MagicMock()
+        mock_robot.cameras = {"head": zmq_cam}
+
+        obs = {"state": np.array([0.1, 0.2, 0.3])}
+        self._send_features_to_zmq_cameras(mock_robot, obs)
+
+        called_features = zmq_cam.send_features.call_args[0][0]
+        assert called_features["state"] == [0.1, 0.2, 0.3]
+        assert isinstance(called_features["state"], list)
+
+    def test_no_op_when_robot_has_no_cameras(self):
+        """Should not raise when robot has no cameras attribute."""
+        mock_robot = MagicMock(spec=[])
+        # Should not raise
+        self._send_features_to_zmq_cameras(mock_robot, {"pos": 0.5})
+
+    def test_skips_non_zmq_cameras(self):
+        """Non-ZMQ cameras should be ignored."""
+        zmq_cam = _make_camera()
+        zmq_cam.send_features = MagicMock()
+        other_cam = MagicMock(spec=[])
+
+        mock_robot = MagicMock()
+        mock_robot.cameras = {"zmq": zmq_cam, "other": other_cam}
+
+        self._send_features_to_zmq_cameras(mock_robot, {"pos": 1.0})
+
+        zmq_cam.send_features.assert_called_once()
+        assert not hasattr(other_cam, "send_features")
+
+    def test_sends_to_multiple_zmq_cameras(self):
+        """All ZMQ cameras receive the same features dict."""
+        zmq_cam1 = _make_camera()
+        zmq_cam2 = _make_camera()
+        zmq_cam1.send_features = MagicMock()
+        zmq_cam2.send_features = MagicMock()
+
+        mock_robot = MagicMock()
+        mock_robot.cameras = {"cam1": zmq_cam1, "cam2": zmq_cam2}
+
+        obs = {"pos": 0.7}
+        self._send_features_to_zmq_cameras(mock_robot, obs)
+
+        zmq_cam1.send_features.assert_called_once_with({"pos": 0.7})
+        zmq_cam2.send_features.assert_called_once_with({"pos": 0.7})
 # ---------------------------------------------------------------------------
 # Helpers shared by protocol decode tests
 # ---------------------------------------------------------------------------
