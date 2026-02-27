@@ -15,12 +15,28 @@
 # limitations under the License.
 
 """
-ZMQCamera - Captures frames from remote cameras via ZeroMQ using JSON protocol in the
-following format:
-    {
-        "timestamps": {"camera_name": float},
-        "images": {"camera_name": "<base64-jpeg>"}
-    }
+ZMQCamera - Captures frames from remote cameras via ZeroMQ.
+
+Supports two protocol versions:
+
+**Protocol v2 (multipart binary – default):**
+  The server sends a multipart ZMQ message per tick::
+
+    Part 0  – UTF-8 JSON metadata:
+                { "timestamps": {"cam": float},
+                  "cameras": ["cam1", "cam2", ...],
+                  "encoding": "jpeg",
+                  "protocol_version": 2 }
+    Parts 1..N – raw JPEG bytes for each camera listed in ``cameras``
+
+**Legacy protocol v1 (JSON / base64 – fallback):**
+  The server sends a single-part string message::
+
+    { "timestamps": {"cam": float},
+      "images":     {"cam": "<base64-jpeg>"} }
+
+The client auto-detects the protocol by checking whether the received multipart
+message contains more than one part.
 """
 
 import base64
@@ -49,8 +65,11 @@ class ZMQCamera(Camera):
     Manages camera interactions via ZeroMQ for receiving frames from a remote server.
 
     This class connects to a ZMQ Publisher, subscribes to frame topics, and decodes
-    incoming JSON messages containing Base64 encoded images. It supports both
+    incoming multipart messages containing raw JPEG image bytes. It supports both
     synchronous and asynchronous frame reading patterns.
+
+    The new protocol (v2) uses ``send_multipart`` / ``recv_multipart`` with binary
+    JPEG payloads. The legacy JSON/base64 protocol (v1) is supported as a fallback.
 
     Example usage:
         ```python
@@ -206,37 +225,55 @@ class ZMQCamera(Camera):
     def _read_from_hardware(self) -> NDArray[Any]:
         """
         Reads a single frame directly from the ZMQ socket.
+
+        Supports both protocol v2 (multipart binary JPEG) and the legacy v1
+        (single-part JSON / base64) format.  Protocol is auto-detected: if the
+        received message contains more than one part it is treated as v2;
+        otherwise the single part is parsed as legacy JSON.
         """
         if not self.is_connected or self.socket is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         try:
-            message = self.socket.recv_string()
+            parts = self.socket.recv_multipart()
         except Exception as e:
             # Check for ZMQ timeout (EAGAIN/Again) without requiring global zmq import
             if type(e).__name__ == "Again":
                 raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
             raise
 
-        # Decode JSON message
-        data = json.loads(message)
+        if len(parts) > 1:
+            # Protocol v2: multipart binary JPEG
+            meta = json.loads(parts[0].decode("utf-8"))
+            cameras = meta.get("cameras", [])
 
-        if "images" not in data:
-            raise RuntimeError(f"{self} invalid message: missing 'images' key")
+            if self.camera_name in cameras:
+                idx = cameras.index(self.camera_name)
+            elif cameras:
+                idx = 0
+            else:
+                raise RuntimeError(f"{self} no cameras in metadata")
 
-        images = data["images"]
-
-        # Get image by camera name or first available
-        if self.camera_name in images:
-            img_b64 = images[self.camera_name]
-        elif images:
-            img_b64 = next(iter(images.values()))
+            jpeg_bytes = parts[idx + 1]
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
         else:
-            raise RuntimeError(f"{self} no images in message")
+            # Legacy protocol v1: single-part JSON / base64
+            data = json.loads(parts[0].decode("utf-8"))
 
-        # Decode base64 JPEG
-        img_bytes = base64.b64decode(img_b64)
-        frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if "images" not in data:
+                raise RuntimeError(f"{self} invalid message: missing 'images' key")
+
+            images = data["images"]
+
+            if self.camera_name in images:
+                img_b64 = images[self.camera_name]
+            elif images:
+                img_b64 = next(iter(images.values()))
+            else:
+                raise RuntimeError(f"{self} no images in message")
+
+            img_bytes = base64.b64decode(img_b64)
+            frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
 
         if frame is None:
             raise RuntimeError(f"{self} failed to decode image")

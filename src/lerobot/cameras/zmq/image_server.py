@@ -15,11 +15,19 @@
 # limitations under the License.
 
 """
-Streams camera images over ZMQ.
-Uses lerobot's OpenCVCamera for capture, encodes images to base64 and sends them over ZMQ.
+Streams camera images over ZMQ using a multipart binary protocol.
+
+Protocol (version 2):
+  - Part 0: UTF-8 JSON metadata with keys:
+      ``timestamps``        – mapping of camera_name -> float
+      ``cameras``           – ordered list of camera names (matches binary parts below)
+      ``encoding``          – ``"jpeg"``
+      ``protocol_version``  – ``2``
+  - Parts 1..N: raw JPEG bytes for each camera in the order given by ``cameras``.
+
+The server uses ``socket.send_multipart([meta_bytes, jpeg1, jpeg2, ...])``.
 """
 
-import base64
 import contextlib
 import json
 import logging
@@ -36,10 +44,10 @@ from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 logger = logging.getLogger(__name__)
 
 
-def encode_image(image: np.ndarray, quality: int = 80) -> str:
-    """Encode RGB image to base64 JPEG string."""
+def encode_image(image: np.ndarray, quality: int = 80) -> bytes:
+    """Encode RGB image to raw JPEG bytes."""
     _, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    return base64.b64encode(buffer).decode("utf-8")
+    return buffer.tobytes()
 
 
 class ImageServer:
@@ -102,16 +110,26 @@ class ImageServer:
             while True:
                 t0 = time.time()
 
-                # Build message
-                message = {"timestamps": {}, "images": {}}
+                # Build multipart message: metadata + one JPEG part per camera
+                camera_names = list(self.cameras.keys())
+                timestamps: dict[str, float] = {}
+                jpeg_parts: list[bytes] = []
                 for name, cam in self.cameras.items():
                     frame = cam.read()  # Returns RGB
-                    message["timestamps"][name] = time.time()
-                    message["images"][name] = encode_image(frame)
+                    timestamps[name] = time.time()
+                    jpeg_parts.append(encode_image(frame))
 
-                # Send as JSON string (suppress if buffer full)
+                meta = {
+                    "timestamps": timestamps,
+                    "cameras": camera_names,
+                    "encoding": "jpeg",
+                    "protocol_version": 2,
+                }
+                parts = [json.dumps(meta).encode("utf-8")] + jpeg_parts
+
+                # Send as multipart (suppress if buffer full)
                 with contextlib.suppress(zmq.Again):
-                    self.socket.send_string(json.dumps(message), zmq.NOBLOCK)
+                    self.socket.send_multipart(parts, zmq.NOBLOCK)
 
                 self._handle_events()
 
