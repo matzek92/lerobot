@@ -182,3 +182,82 @@ class TestNotifyZMQCameras:
         # Should not raise
         self._notify_zmq_cameras(mock_robot, "reset_done")
 
+
+class TestZMQCameraFeaturesConfig:
+    def test_features_port_default_is_none(self):
+        config = ZMQCameraConfig(server_address="127.0.0.1")
+        assert config.features_port is None
+
+    def test_features_port_valid(self):
+        config = ZMQCameraConfig(server_address="127.0.0.1", features_port=5557)
+        assert config.features_port == 5557
+
+    def test_features_port_invalid_zero(self):
+        with pytest.raises(ValueError, match="features_port"):
+            ZMQCameraConfig(server_address="127.0.0.1", features_port=0)
+
+    def test_features_port_invalid_too_large(self):
+        with pytest.raises(ValueError, match="features_port"):
+            ZMQCameraConfig(server_address="127.0.0.1", features_port=99999)
+
+
+class TestZMQCameraSendFeatures:
+    def test_send_features_no_op_without_features_port(self):
+        """send_features should silently do nothing when features_port is not configured."""
+        camera = _make_camera()
+        assert camera.features_socket is None
+        # Should not raise
+        camera.send_features({"joint_positions": [0.0, 1.0]})
+
+    def test_send_features_sends_json_with_features(self):
+        """send_features should push a JSON message containing the features dict."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        camera.features_socket = mock_socket
+
+        features = {"joint_positions": [0.1, 0.2, 0.3], "gripper": 0.5}
+        camera.send_features(features)
+
+        mock_socket.send_string.assert_called_once()
+        sent_message = mock_socket.send_string.call_args[0][0]
+        data = json.loads(sent_message)
+        assert data["features"] == features
+        assert "timestamp" in data
+
+    def test_send_features_includes_timestamp(self):
+        """send_features should include a float timestamp close to the current time."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        camera.features_socket = mock_socket
+
+        before = time.time()
+        camera.send_features({"sensor": 42.0})
+        after = time.time()
+
+        sent_message = mock_socket.send_string.call_args[0][0]
+        data = json.loads(sent_message)
+        assert before <= data["timestamp"] <= after
+
+    def test_send_features_suppresses_zmq_errors(self):
+        """send_features should log a warning instead of raising on ZMQ errors."""
+        camera = _make_camera()
+        mock_socket = MagicMock()
+        mock_socket.send_string.side_effect = RuntimeError("zmq error")
+        camera.features_socket = mock_socket
+
+        # Should not raise
+        camera.send_features({"joint_positions": [0.0]})
+
+    def test_features_socket_created_when_features_port_configured(self):
+        """features_socket should be assignable when features_port is configured."""
+        config = ZMQCameraConfig(server_address="127.0.0.1", features_port=5557)
+        camera = ZMQCamera(config)
+        mock_push_socket = MagicMock()
+        camera.features_socket = mock_push_socket
+        assert camera.features_socket is mock_push_socket
+
+    def test_no_features_socket_without_features_port(self):
+        """features_socket should be None when features_port is not configured."""
+        camera = _make_camera()
+        assert camera.features_socket is None
+

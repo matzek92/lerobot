@@ -43,7 +43,7 @@ def encode_image(image: np.ndarray, quality: int = 80) -> str:
 
 
 class ImageServer:
-    def __init__(self, config: dict, port: int = 5555, event_port: int | None = None):
+    def __init__(self, config: dict, port: int = 5555, event_port: int | None = None, features_port: int | None = None):
         self.fps = config.get("fps", 30)
         self.cameras: dict[str, OpenCVCamera] = {}
 
@@ -76,6 +76,15 @@ class ImageServer:
             self.event_socket.bind(f"tcp://*:{event_port}")
             logger.info(f"ImageServer event listener on port {event_port}")
 
+        # Optional ZMQ PULL socket for receiving robot features and sensor readings
+        self.features_socket: zmq.Socket | None = None
+        self.latest_features: dict | None = None
+        if features_port is not None:
+            self.features_socket = self.context.socket(zmq.PULL)
+            self.features_socket.setsockopt(zmq.LINGER, 0)
+            self.features_socket.bind(f"tcp://*:{features_port}")
+            logger.info(f"ImageServer features listener on port {features_port}")
+
         logger.info(f"ImageServer running on port {port}")
 
     def _handle_events(self) -> None:
@@ -92,6 +101,22 @@ class ImageServer:
                 break
             except Exception as e:
                 logger.warning(f"Error handling recording event: {e}")
+                break
+
+    def _handle_features(self) -> None:
+        """Process any pending robot features and sensor readings (non-blocking)."""
+        if self.features_socket is None:
+            return
+        while True:
+            try:
+                message = self.features_socket.recv_string(zmq.NOBLOCK)
+                data = json.loads(message)
+                self.latest_features = data.get("features")
+                logger.debug("Received robot features")
+            except zmq.Again:
+                break
+            except Exception as e:
+                logger.warning(f"Error handling robot features: {e}")
                 break
 
     def run(self):
@@ -114,6 +139,7 @@ class ImageServer:
                     self.socket.send_string(json.dumps(message), zmq.NOBLOCK)
 
                 self._handle_events()
+                self._handle_features()
 
                 frame_count += 1
                 frame_times.append(time.time() - t0)
@@ -130,6 +156,8 @@ class ImageServer:
         finally:
             for cam in self.cameras.values():
                 cam.disconnect()
+            if self.features_socket is not None:
+                self.features_socket.close()
             if self.event_socket is not None:
                 self.event_socket.close()
             self.socket.close()
