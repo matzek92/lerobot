@@ -16,6 +16,7 @@
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
 from typing import Any
@@ -230,12 +231,23 @@ class ZmqSensorConfig:
         feature_dim: Expected number of float values per message.
         timeout_ms: Socket receive timeout in milliseconds. If no message arrives
             within this period the last received value (or zeros) is reused.
+        optional: If ``True`` (default), a missing or unresponsive publisher only
+            emits a warning and the processor falls back to zeros — the pipeline
+            continues running.  Set to ``False`` to raise a
+            :exc:`ConnectionError` during :py:meth:`ZmqSensorClient.connect`
+            when the publisher does not respond within ``warmup_s`` seconds.
+        warmup_s: Seconds to wait for the first message from the publisher
+            during :py:meth:`ZmqSensorClient.connect`.  ``0.0`` (default)
+            means no warmup check is performed — the behaviour is then
+            identical to cameras with ``warmup=False``.
     """
 
     address: str = "127.0.0.1"
     port: int = 5600
     feature_dim: int = 1
     timeout_ms: int = 100
+    optional: bool = True
+    warmup_s: float = 0.0
 
 
 class ZmqSensorClient:
@@ -260,7 +272,17 @@ class ZmqSensorClient:
         self._thread: Thread | None = None
 
     def connect(self) -> None:
-        """Connect to the ZMQ publisher and start the background read thread."""
+        """Connect to the ZMQ publisher and start the background read thread.
+
+        If :py:attr:`ZmqSensorConfig.warmup_s` is greater than zero, this
+        method waits up to that many seconds for the first message from the
+        publisher.  When no message arrives within the warmup window:
+
+        * ``optional=True`` (default) — logs a warning and continues.  The
+          sensor will return zeros until the publisher comes online.
+        * ``optional=False`` — raises :exc:`ConnectionError`.  Use this when
+          the sensor is a hard requirement for the pipeline.
+        """
         import zmq
 
         self._context = zmq.Context()
@@ -280,6 +302,29 @@ class ZmqSensorClient:
         logger.info(
             f"ZmqSensorClient connected to tcp://{self.config.address}:{self.config.port}"
         )
+
+        if self.config.warmup_s > 0:
+            deadline = time.time() + self.config.warmup_s
+            while time.time() < deadline:
+                with self._lock:
+                    if self._latest_features is not None:
+                        break
+                time.sleep(0.05)
+            else:
+                addr = f"tcp://{self.config.address}:{self.config.port}"
+                if self.config.optional:
+                    logger.warning(
+                        f"ZmqSensorClient: no data received from {addr} within "
+                        f"{self.config.warmup_s}s warmup. Sensor is optional — "
+                        "continuing with zeros."
+                    )
+                else:
+                    self.disconnect()
+                    raise ConnectionError(
+                        f"ZmqSensorClient: no data received from {addr} within "
+                        f"{self.config.warmup_s}s warmup. Publisher may not be running. "
+                        "Set optional=True to continue with zeros instead of raising."
+                    )
 
     def _read_loop(self) -> None:
         import zmq
@@ -377,6 +422,8 @@ class ZmqObservationProcessorStep(ObservationProcessorStep):
                     "port": cfg.port,
                     "feature_dim": cfg.feature_dim,
                     "timeout_ms": cfg.timeout_ms,
+                    "optional": cfg.optional,
+                    "warmup_s": cfg.warmup_s,
                 }
                 for cfg in self.zmq_configs
             ]

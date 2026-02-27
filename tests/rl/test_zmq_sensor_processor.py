@@ -63,6 +63,8 @@ def test_zmq_sensor_config_defaults():
     assert cfg.port == 5600
     assert cfg.feature_dim == 1
     assert cfg.timeout_ms == 100
+    assert cfg.optional is True
+    assert cfg.warmup_s == 0.0
 
 
 def test_zmq_sensor_config_custom():
@@ -71,6 +73,12 @@ def test_zmq_sensor_config_custom():
     assert cfg.port == 9000
     assert cfg.feature_dim == 5
     assert cfg.timeout_ms == 50
+
+
+def test_zmq_sensor_config_optional_false():
+    cfg = ZmqSensorConfig(optional=False, warmup_s=0.5)
+    assert cfg.optional is False
+    assert cfg.warmup_s == 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +270,115 @@ def test_zmq_processor_get_config():
     assert config["zmq_configs"][0]["timeout_ms"] == 200
 
 
+def test_zmq_processor_get_config_includes_optional_and_warmup():
+    step = ZmqObservationProcessorStep.__new__(ZmqObservationProcessorStep)
+    cfg = ZmqSensorConfig(address="10.0.0.1", port=6000, feature_dim=4, timeout_ms=200, optional=False, warmup_s=1.5)
+    step.zmq_configs = [cfg]
+    step._clients = []
+
+    config = step.get_config()
+    assert config["zmq_configs"][0]["optional"] is False
+    assert config["zmq_configs"][0]["warmup_s"] == 1.5
+
+
 def test_zmq_processor_reset_does_not_raise():
     step = ZmqObservationProcessorStep.__new__(ZmqObservationProcessorStep)
     step.zmq_configs = []
     step._clients = []
     step.reset()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# optional / warmup behaviour (mocked socket)
+# ---------------------------------------------------------------------------
+
+
+def _make_timeout_socket():
+    """Return a mock ZMQ socket whose recv_string always times out."""
+    import zmq
+
+    mock_socket = MagicMock()
+    mock_socket.recv_string.side_effect = zmq.Again()
+    return mock_socket
+
+
+def _patched_connect(client, mock_socket):
+    """Call client.connect() with a fully mocked ZMQ context/socket."""
+    with patch("zmq.Context") as mock_ctx_cls:
+        mock_ctx = MagicMock()
+        mock_ctx_cls.return_value = mock_ctx
+        mock_ctx.socket.return_value = mock_socket
+        client.connect()
+
+
+def test_connect_no_warmup_does_not_raise_when_publisher_absent():
+    """warmup_s=0 (default) — connect never blocks, even with no publisher."""
+    import zmq
+
+    cfg = ZmqSensorConfig(feature_dim=2, timeout_ms=10, optional=False, warmup_s=0.0)
+    client = ZmqSensorClient(cfg)
+    mock_socket = MagicMock()
+    mock_socket.recv_string.side_effect = zmq.Again()
+
+    _patched_connect(client, mock_socket)
+    client.disconnect()  # Should not raise
+
+
+def test_connect_optional_warmup_warns_when_no_publisher(caplog):
+    """optional=True + warmup_s>0 — logs a warning but does not raise."""
+    import logging
+
+    import zmq
+
+    cfg = ZmqSensorConfig(feature_dim=2, timeout_ms=10, optional=True, warmup_s=0.1)
+    client = ZmqSensorClient(cfg)
+    mock_socket = MagicMock()
+    mock_socket.recv_string.side_effect = zmq.Again()
+
+    with caplog.at_level(logging.WARNING, logger="lerobot.rl.joint_observations_processor"):
+        _patched_connect(client, mock_socket)
+
+    client.disconnect()
+
+    assert any("optional" in record.message for record in caplog.records)
+
+
+def test_connect_required_warmup_raises_when_no_publisher():
+    """optional=False + warmup_s>0 — raises ConnectionError if no publisher."""
+    import zmq
+
+    import pytest
+
+    cfg = ZmqSensorConfig(feature_dim=2, timeout_ms=10, optional=False, warmup_s=0.1)
+    client = ZmqSensorClient(cfg)
+    mock_socket = MagicMock()
+    mock_socket.recv_string.side_effect = zmq.Again()
+
+    with pytest.raises(ConnectionError, match="no data received"):
+        _patched_connect(client, mock_socket)
+
+
+def test_connect_required_warmup_succeeds_when_publisher_responds():
+    """optional=False + warmup_s>0 — succeeds when publisher sends data quickly."""
+    import zmq
+
+    cfg = ZmqSensorConfig(feature_dim=2, timeout_ms=10, optional=False, warmup_s=0.5)
+    client = ZmqSensorClient(cfg)
+
+    # Simulate publisher: first call times out, second delivers data
+    call_count = {"n": 0}
+
+    def recv_side_effect():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise zmq.Again()
+        import json as _json
+        return _json.dumps({"timestamp": 0.0, "features": [1.0, 2.0]})
+
+    mock_socket = MagicMock()
+    mock_socket.recv_string.side_effect = recv_side_effect
+
+    _patched_connect(client, mock_socket)
+
+    assert client.read_latest() == [1.0, 2.0]
+    client.disconnect()
