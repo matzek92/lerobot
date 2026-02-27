@@ -26,6 +26,7 @@ from lerobot.motors.feetech import (
     OperatingMode,
 )
 from lerobot.processor import RobotAction, RobotObservation
+from lerobot.sensors.utils import make_sensors_from_configs
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -62,6 +63,7 @@ class SOFollower(Robot):
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+        self.sensors = make_sensors_from_configs(config.sensors)
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -73,9 +75,27 @@ class SOFollower(Robot):
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
         }
 
+    @property
+    def _sensors_ft(self) -> dict[str, type]:
+        """Feature map for attached sensors.
+
+        Each sensor contributes one float entry per feature dimension.
+        A single-dimension sensor uses the sensor name as the key directly
+        (e.g. ``"force"``).  A multi-dimension sensor uses dot-indexed keys
+        (e.g. ``"imu.0"``, ``"imu.1"``).
+        """
+        ft: dict[str, type] = {}
+        for key, cfg in self.config.sensors.items():
+            if cfg.feature_dim == 1:
+                ft[key] = float
+            else:
+                for i in range(cfg.feature_dim):
+                    ft[f"{key}.{i}"] = float
+        return ft
+
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft, **self._cameras_ft, **self._sensors_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -83,7 +103,11 @@ class SOFollower(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+        return (
+            self.bus.is_connected
+            and all(cam.is_connected for cam in self.cameras.values())
+            and all(s.is_connected for s in self.sensors.values())
+        )
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -101,6 +125,9 @@ class SOFollower(Robot):
 
         for cam in self.cameras.values():
             cam.connect()
+
+        for sensor in self.sensors.values():
+            sensor.connect()
 
         self.configure()
         logger.info(f"{self} connected.")
@@ -191,6 +218,18 @@ class SOFollower(Robot):
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
+        # Read values from attached sensors
+        for sensor_key, sensor in self.sensors.items():
+            start = time.perf_counter()
+            values = sensor.read_latest()
+            if len(values) == 1:
+                obs_dict[sensor_key] = values[0]
+            else:
+                for i, v in enumerate(values):
+                    obs_dict[f"{sensor_key}.{i}"] = v
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read sensor {sensor_key}: {dt_ms:.1f}ms")
+
         return obs_dict
 
     @check_if_not_connected
@@ -226,6 +265,8 @@ class SOFollower(Robot):
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
+        for sensor in self.sensors.values():
+            sensor.disconnect()
 
         logger.info(f"{self} disconnected.")
 

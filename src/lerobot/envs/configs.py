@@ -211,10 +211,9 @@ class ObservationConfig:
     """List of ZMQ sensor subscription configs.
 
     Each entry is a dict with keys ``address`` (str), ``port`` (int),
-    ``feature_dim`` (int) and optionally ``timeout_ms`` (int),
-    ``optional`` (bool, default ``True``), ``warmup_s`` (float, default ``0.0``).
-    The features received from these publishers are appended to
-    ``observation.state`` in the order they appear in the list.
+    ``feature_dim`` (int) and optionally ``timeout_ms`` (int).  The features
+    received from these publishers are appended to ``observation.state`` in the
+    order they appear in the list.
 
     Example YAML::
 
@@ -222,23 +221,6 @@ class ObservationConfig:
           - address: "127.0.0.1"
             port: 5600
             feature_dim: 3
-    """
-    serial_sensor_subscriptions: list | None = None
-    """List of serial sensor subscription configs.
-
-    Each entry is a dict with keys ``port`` (str), ``baudrate`` (int),
-    ``feature_dim`` (int) and optionally ``read_timeout_s`` (float),
-    ``optional`` (bool, default ``True``), ``warmup_s`` (float, default ``0.0``).
-    The device must emit newline-terminated lines of comma/space-separated floats
-    (or JSON ``{"features": [...]}``) at ≥ 30 Hz.  Features are appended to
-    ``observation.state`` in the order they appear in the list.
-
-    Example YAML::
-
-        serial_sensor_subscriptions:
-          - port: "/dev/ttyUSB0"
-            baudrate: 115200
-            feature_dim: 6
     """
 
 

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 from lerobot.cameras import CameraConfig
+from lerobot.sensors import SensorConfig
 
 from ..config import RobotConfig
 
@@ -38,6 +39,9 @@ class SOFollowerConfig:
 
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # sensors (serial or other hardware sensors attached to the robot PC)
+    sensors: dict[str, SensorConfig] = field(default_factory=dict)
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
