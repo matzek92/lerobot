@@ -80,6 +80,8 @@ from lerobot.utils.utils import log_say
 from .joint_observations_processor import (
     JointVelocityProcessorStep,
     MotorCurrentProcessorStep,
+    SerialObservationProcessorStep,
+    SerialSensorConfig,
     ZmqObservationProcessorStep,
     ZmqSensorConfig,
 )
@@ -423,6 +425,12 @@ def make_processors(
                 ZmqSensorConfig(**sub) for sub in cfg.processor.observation.zmq_sensor_subscriptions
             ]
             env_pipeline_steps.append(ZmqObservationProcessorStep(zmq_configs=zmq_configs))
+        if cfg.processor.observation.serial_sensor_subscriptions:
+            serial_configs = [
+                SerialSensorConfig(**sub)
+                for sub in cfg.processor.observation.serial_sensor_subscriptions
+            ]
+            env_pipeline_steps.append(SerialObservationProcessorStep(serial_configs=serial_configs))
 
     add_ee_pose = (
         cfg.processor.observation is not None and cfg.processor.observation.add_ee_pose_to_observation

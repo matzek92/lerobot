@@ -459,3 +459,320 @@ class ZmqObservationProcessorStep(ObservationProcessorStep):
         """Disconnect all ZMQ clients."""
         for client in self._clients:
             client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Serial sensor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SerialSensorConfig:
+    """Configuration for a serial-port sensor subscription.
+
+    The sensor device must emit newline-terminated UTF-8 text lines at least
+    30 times per second.  Two line formats are accepted:
+
+    * **CSV / space-separated floats** (simple and fast)::
+
+          1.0,2.0,3.0\\n
+          1.0 2.0 3.0\\n
+
+    * **JSON** (same schema as the ZMQ sensor)::
+
+          {"timestamp": 1234.5, "features": [1.0, 2.0, 3.0]}\\n
+
+    Attributes:
+        port: Serial device path, e.g. ``"/dev/ttyUSB0"`` or ``"COM3"``.
+        baudrate: Communication speed.  Must match the device's setting.
+        feature_dim: Expected number of float values per message.  Used for
+            the zeros fallback and for :py:meth:`transform_features`.
+        read_timeout_s: Per-line read timeout passed to ``serial.Serial``.
+            Keep it short (≤ 1/30 s) so the background thread remains
+            responsive to the stop event.
+        optional: If ``True`` (default), a missing or unresponsive device
+            only emits a warning and the processor falls back to zeros.
+            Set to ``False`` to raise :exc:`ConnectionError` during
+            :py:meth:`SerialSensorClient.connect` when no data arrives within
+            ``warmup_s`` seconds.
+        warmup_s: Seconds to wait for the first valid line during
+            :py:meth:`SerialSensorClient.connect`.  ``0.0`` (default) skips
+            the warmup check entirely.
+    """
+
+    port: str = "/dev/ttyUSB0"
+    baudrate: int = 115200
+    feature_dim: int = 1
+    read_timeout_s: float = 0.033  # ≈ 1 frame at 30 Hz
+    optional: bool = True
+    warmup_s: float = 0.0
+
+
+def _parse_serial_line(line: bytes, feature_dim: int) -> list[float] | None:
+    """Parse a single serial line into a list of floats.
+
+    Accepts JSON ``{"features": [...]}`` or plain CSV/whitespace-separated numbers.
+
+    Returns ``None`` when the line cannot be parsed or contains too few values.
+    """
+    text = line.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return None
+    # Try JSON first
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            features = data.get("features")
+            if features is not None and len(features) >= feature_dim:
+                return [float(v) for v in features[:feature_dim]]
+        except json.JSONDecodeError:
+            pass
+        return None
+    # CSV / space-separated
+    sep = "," if "," in text else None
+    parts = text.split(sep)
+    try:
+        values = [float(p.strip()) for p in parts if p.strip()]
+    except ValueError:
+        return None
+    if len(values) < feature_dim:
+        return None
+    return values[:feature_dim]
+
+
+class SerialSensorClient:
+    """Reads feature vectors from a serial port in a background thread.
+
+    The device must send newline-terminated lines at ≥ 30 Hz.  The background
+    thread drains any backlogged bytes so :py:meth:`read_latest` always returns
+    the freshest sample without blocking.
+
+    Accepted line formats:
+
+    * CSV / space-separated floats: ``1.0,2.0,3.0\\n``
+    * JSON: ``{"timestamp": 0.0, "features": [1.0, 2.0, 3.0]}\\n``
+
+    Args:
+        config: :class:`SerialSensorConfig` describing the connection.
+    """
+
+    def __init__(self, config: SerialSensorConfig) -> None:
+        self.config = config
+        self._lock: Lock = Lock()
+        self._latest_features: list[float] | None = None
+        self._stop_event: Event = Event()
+        self._thread: Thread | None = None
+        self._ser = None  # serial.Serial instance
+
+    def connect(self) -> None:
+        """Open the serial port and start the background read thread.
+
+        If :py:attr:`SerialSensorConfig.warmup_s` is greater than zero, this
+        method waits up to that many seconds for the first valid line.  When no
+        valid line arrives within the warmup window:
+
+        * ``optional=True`` (default) — logs a warning and continues.  The
+          processor falls back to zeros until the device starts sending.
+        * ``optional=False`` — raises :exc:`ConnectionError`.
+        """
+        import serial
+
+        try:
+            self._ser = serial.Serial(
+                port=self.config.port,
+                baudrate=self.config.baudrate,
+                timeout=self.config.read_timeout_s,
+            )
+            self._ser.reset_input_buffer()
+        except serial.SerialException as exc:
+            if self.config.optional:
+                logger.warning(
+                    f"SerialSensorClient: could not open {self.config.port!r}: {exc}. "
+                    "Sensor is optional — continuing with zeros."
+                )
+                return
+            raise ConnectionError(
+                f"SerialSensorClient: could not open {self.config.port!r}: {exc}"
+            ) from exc
+
+        self._stop_event.clear()
+        self._thread = Thread(
+            target=self._read_loop,
+            daemon=True,
+            name=f"SerialSensorClient_{self.config.port}",
+        )
+        self._thread.start()
+        logger.info(f"SerialSensorClient connected to {self.config.port!r} @ {self.config.baudrate} baud")
+
+        if self.config.warmup_s > 0:
+            deadline = time.time() + self.config.warmup_s
+            while time.time() < deadline:
+                with self._lock:
+                    if self._latest_features is not None:
+                        break
+                time.sleep(0.02)
+            else:
+                if self.config.optional:
+                    logger.warning(
+                        f"SerialSensorClient: no valid data from {self.config.port!r} within "
+                        f"{self.config.warmup_s}s warmup. Sensor is optional — "
+                        "continuing with zeros."
+                    )
+                else:
+                    self.disconnect()
+                    raise ConnectionError(
+                        f"SerialSensorClient: no valid data from {self.config.port!r} within "
+                        f"{self.config.warmup_s}s warmup. Check that the device is connected "
+                        "and sending data. Set optional=True to continue with zeros instead."
+                    )
+
+    def _read_loop(self) -> None:
+        """Background thread: continuously drain and parse the serial buffer."""
+        while not self._stop_event.is_set():
+            try:
+                if self._ser is None or not self._ser.is_open:
+                    break
+                # Drain the buffer — keep only the newest complete line
+                latest_line: bytes | None = None
+                while self._ser.in_waiting > 0:
+                    line = self._ser.readline()
+                    if line:
+                        latest_line = line
+
+                if latest_line is None:
+                    # Nothing buffered yet — do a blocking readline with the configured timeout
+                    latest_line = self._ser.readline()
+
+                if latest_line:
+                    features = _parse_serial_line(latest_line, self.config.feature_dim)
+                    if features is not None:
+                        with self._lock:
+                            self._latest_features = features
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"SerialSensorClient read error: {exc}")
+
+    def read_latest(self) -> list[float]:
+        """Return the most recent feature vector, or zeros if none received yet."""
+        with self._lock:
+            if self._latest_features is not None:
+                return list(self._latest_features)
+        return [0.0] * self.config.feature_dim
+
+    def disconnect(self) -> None:
+        """Stop the background thread and close the serial port."""
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ser = None
+        logger.info(f"SerialSensorClient disconnected from {self.config.port!r}")
+
+
+@dataclass
+@ProcessorStepRegistry.register("serial_sensor_processor")
+class SerialObservationProcessorStep(ObservationProcessorStep):
+    """Reads features from a serial-port sensor and appends them to ``observation.state``.
+
+    Devices connected via a serial interface (USB-to-Serial, UART, …) can stream
+    additional sensor data at ≥ 30 Hz.  This step receives those values and
+    concatenates them to the existing robot state vector so that downstream
+    policies treat them identically to motor states.
+
+    Accepted line formats::
+
+        # CSV / whitespace-separated floats
+        1.0,2.0,3.0\\n
+
+        # JSON (same schema as the ZMQ sensor)
+        {"timestamp": 1234.5, "features": [1.0, 2.0, 3.0]}\\n
+
+    Attributes:
+        serial_configs: List of :class:`SerialSensorConfig` instances, one per
+            serial device.  Multiple devices are concatenated in order.
+        _clients: :class:`SerialSensorClient` instances created on construction.
+    """
+
+    serial_configs: list[SerialSensorConfig] = field(default_factory=list)
+    _clients: list[SerialSensorClient] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._clients = [SerialSensorClient(cfg) for cfg in self.serial_configs]
+        for client in self._clients:
+            client.connect()
+
+    def observation(self, observation: dict) -> dict:
+        """Fetch serial features and append them to ``observation.state``.
+
+        Args:
+            observation: Input observation dictionary.
+
+        Returns:
+            Updated observation dictionary with serial features appended to the state.
+        """
+        if not self._clients:
+            return observation
+
+        all_features: list[float] = []
+        for client in self._clients:
+            all_features.extend(client.read_latest())
+
+        serial_tensor = torch.tensor(all_features, dtype=torch.float32).unsqueeze(0)
+
+        current_state = observation.get(OBS_STATE)
+        if current_state is None:
+            observation[OBS_STATE] = serial_tensor
+            return observation
+
+        new_observation = dict(observation)
+        new_observation[OBS_STATE] = torch.cat([current_state, serial_tensor], dim=-1)
+        return new_observation
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "serial_configs": [
+                {
+                    "port": cfg.port,
+                    "baudrate": cfg.baudrate,
+                    "feature_dim": cfg.feature_dim,
+                    "read_timeout_s": cfg.read_timeout_s,
+                    "optional": cfg.optional,
+                    "warmup_s": cfg.warmup_s,
+                }
+                for cfg in self.serial_configs
+            ]
+        }
+
+    def reset(self) -> None:
+        """No state to reset between episodes."""
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Extends ``observation.state`` shape to account for the serial features.
+
+        Args:
+            features: Policy features dictionary.
+
+        Returns:
+            Updated policy features dictionary.
+        """
+        total_serial_dim = sum(cfg.feature_dim for cfg in self.serial_configs)
+        if total_serial_dim == 0:
+            return features
+
+        if OBS_STATE in features[PipelineFeatureType.OBSERVATION]:
+            original_feature = features[PipelineFeatureType.OBSERVATION][OBS_STATE]
+            new_shape = (original_feature.shape[0] + total_serial_dim,) + original_feature.shape[1:]
+            features[PipelineFeatureType.OBSERVATION][OBS_STATE] = PolicyFeature(
+                type=original_feature.type, shape=new_shape
+            )
+        return features
+
+    def disconnect(self) -> None:
+        """Disconnect all serial clients."""
+        for client in self._clients:
+            client.disconnect()
