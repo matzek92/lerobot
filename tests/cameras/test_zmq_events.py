@@ -19,10 +19,13 @@
 # pytest tests/cameras/test_zmq_events.py
 # ```
 
+import base64
 import json
 import time
 from unittest.mock import MagicMock, patch
 
+import cv2
+import numpy as np
 import pytest
 
 from lerobot.cameras.zmq.camera_zmq import ZMQCamera
@@ -357,4 +360,193 @@ class TestSendFeaturesToZMQCameras:
 
         zmq_cam1.send_features.assert_called_once_with({"pos": 0.7})
         zmq_cam2.send_features.assert_called_once_with({"pos": 0.7})
+# ---------------------------------------------------------------------------
+# Helpers shared by protocol decode tests
+# ---------------------------------------------------------------------------
+
+def _make_jpeg_bytes(color: tuple[int, int, int] = (128, 64, 32), size: tuple[int, int] = (10, 10)) -> bytes:
+    """Create a minimal JPEG payload from a solid-color image."""
+    img = np.full((size[0], size[1], 3), color, dtype=np.uint8)
+    _, buf = cv2.imencode(".jpg", img)
+    return buf.tobytes()
+
+
+def _connected_camera(camera_name: str = "test_cam") -> tuple[ZMQCamera, MagicMock]:
+    """Return a ZMQCamera whose ZMQ socket is fully mocked and marked connected."""
+    config = ZMQCameraConfig(server_address="127.0.0.1", port=5555, camera_name=camera_name)
+    cam = ZMQCamera(config)
+    mock_socket = MagicMock()
+    cam._connected = True
+    cam.context = MagicMock()
+    cam.socket = mock_socket
+    return cam, mock_socket
+
+
+# ---------------------------------------------------------------------------
+# Protocol v2 (multipart binary JPEG) tests
+# ---------------------------------------------------------------------------
+
+class TestReadFromHardwareMultipart:
+    """Tests for the new multipart binary JPEG protocol (protocol_version=2)."""
+
+    def test_multipart_single_camera_returns_frame(self):
+        """A two-part message (meta + one JPEG) should be decoded correctly."""
+        cam, mock_socket = _connected_camera("cam1")
+        jpeg = _make_jpeg_bytes()
+        meta = json.dumps({
+            "timestamps": {"cam1": 1.0},
+            "cameras": ["cam1"],
+            "encoding": "jpeg",
+            "protocol_version": 2,
+        }).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [meta, jpeg]
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+        assert frame.shape[2] == 3  # BGR channels
+
+    def test_multipart_selects_correct_camera_by_name(self):
+        """When multiple cameras are in the message, the correct one is selected."""
+        cam, mock_socket = _connected_camera("cam2")
+        jpeg1 = _make_jpeg_bytes(color=(10, 20, 30))
+        jpeg2 = _make_jpeg_bytes(color=(200, 150, 100))
+        meta = json.dumps({
+            "timestamps": {"cam1": 1.0, "cam2": 1.0},
+            "cameras": ["cam1", "cam2"],
+            "encoding": "jpeg",
+            "protocol_version": 2,
+        }).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [meta, jpeg1, jpeg2]
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+        # Decode jpeg2 independently and compare shape/dtype
+        ref = cv2.imdecode(np.frombuffer(jpeg2, np.uint8), cv2.IMREAD_COLOR)
+        assert frame.shape == ref.shape
+
+    def test_multipart_falls_back_to_first_camera_when_name_missing(self):
+        """If camera_name is not in the metadata, the first camera's frame is returned."""
+        cam, mock_socket = _connected_camera("unknown_cam")
+        jpeg1 = _make_jpeg_bytes(color=(10, 20, 30))
+        jpeg2 = _make_jpeg_bytes(color=(200, 150, 100))
+        meta = json.dumps({
+            "timestamps": {"cam1": 1.0, "cam2": 1.0},
+            "cameras": ["cam1", "cam2"],
+            "encoding": "jpeg",
+            "protocol_version": 2,
+        }).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [meta, jpeg1, jpeg2]
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+        ref = cv2.imdecode(np.frombuffer(jpeg1, np.uint8), cv2.IMREAD_COLOR)
+        assert frame.shape == ref.shape
+
+    def test_multipart_raises_on_empty_cameras_list(self):
+        """An empty cameras list in metadata should raise RuntimeError."""
+        cam, mock_socket = _connected_camera("cam1")
+        jpeg = _make_jpeg_bytes()
+        meta = json.dumps({
+            "timestamps": {},
+            "cameras": [],
+            "encoding": "jpeg",
+            "protocol_version": 2,
+        }).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [meta, jpeg]
+
+        with pytest.raises(RuntimeError, match="no cameras in metadata"):
+            cam._read_from_hardware()
+
+
+# ---------------------------------------------------------------------------
+# Legacy protocol v1 (JSON / base64) fallback tests
+# ---------------------------------------------------------------------------
+
+class TestReadFromHardwareLegacyFallback:
+    """Tests for the legacy JSON/base64 fallback (protocol_version=1)."""
+
+    def _legacy_part(self, images: dict[str, np.ndarray]) -> list[bytes]:
+        """Build a single-part legacy message for given images."""
+        encoded = {
+            name: base64.b64encode(
+                cv2.imencode(".jpg", img)[1].tobytes()
+            ).decode("utf-8")
+            for name, img in images.items()
+        }
+        payload = json.dumps({
+            "timestamps": {k: 1.0 for k in images},
+            "images": encoded,
+        }).encode("utf-8")
+        return [payload]
+
+    def test_legacy_single_camera_returns_frame(self):
+        """A single-part JSON/base64 message should be decoded via the legacy path."""
+        cam, mock_socket = _connected_camera("test_cam")
+        img = np.full((10, 10, 3), 128, dtype=np.uint8)
+        mock_socket.recv_multipart.return_value = self._legacy_part({"test_cam": img})
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+        assert frame.shape[2] == 3
+
+    def test_legacy_selects_correct_camera_by_name(self):
+        """Legacy path should pick the matching camera from the images dict."""
+        cam, mock_socket = _connected_camera("cam2")
+        img1 = np.full((10, 10, 3), 10, dtype=np.uint8)
+        img2 = np.full((10, 10, 3), 200, dtype=np.uint8)
+        mock_socket.recv_multipart.return_value = self._legacy_part({"cam1": img1, "cam2": img2})
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+
+    def test_legacy_falls_back_to_first_when_name_missing(self):
+        """If camera_name is absent in legacy images, the first image is returned."""
+        cam, mock_socket = _connected_camera("unknown")
+        img = np.full((10, 10, 3), 50, dtype=np.uint8)
+        mock_socket.recv_multipart.return_value = self._legacy_part({"only_cam": img})
+
+        frame = cam._read_from_hardware()
+        assert frame is not None
+
+    def test_legacy_raises_when_images_key_missing(self):
+        """A single-part message without 'images' key should raise RuntimeError."""
+        cam, mock_socket = _connected_camera("test_cam")
+        bad_payload = json.dumps({"timestamps": {}}).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [bad_payload]
+
+        with pytest.raises(RuntimeError, match="missing 'images' key"):
+            cam._read_from_hardware()
+
+    def test_legacy_raises_when_images_dict_is_empty(self):
+        """A single-part message with an empty images dict should raise RuntimeError."""
+        cam, mock_socket = _connected_camera("test_cam")
+        bad_payload = json.dumps({"timestamps": {}, "images": {}}).encode("utf-8")
+        mock_socket.recv_multipart.return_value = [bad_payload]
+
+        with pytest.raises(RuntimeError, match="no images in message"):
+            cam._read_from_hardware()
+
+
+# ---------------------------------------------------------------------------
+# encode_image helper tests
+# ---------------------------------------------------------------------------
+
+class TestEncodeImage:
+    """Tests for the updated encode_image helper in image_server."""
+
+    def test_encode_image_returns_bytes(self):
+        from lerobot.cameras.zmq.image_server import encode_image
+
+        img = np.full((10, 10, 3), 128, dtype=np.uint8)
+        result = encode_image(img)
+        assert isinstance(result, bytes)
+
+    def test_encode_image_is_valid_jpeg(self):
+        from lerobot.cameras.zmq.image_server import encode_image
+
+        img = np.full((10, 10, 3), 128, dtype=np.uint8)
+        result = encode_image(img)
+        decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_COLOR)
+        assert decoded is not None
+        assert decoded.shape[2] == 3
 
