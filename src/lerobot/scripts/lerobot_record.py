@@ -165,6 +165,39 @@ def _notify_zmq_cameras(robot: Robot, event_type: str) -> None:
             cam.send_event(event_type)
 
 
+def _send_features_to_zmq_cameras(robot: Robot, obs: dict) -> None:
+    """Send robot observations (features) to all connected ZMQ cameras.
+
+    Sends non-image observation values (e.g. joint positions, sensor readings) to
+    every ZMQ camera that has a ``features_port`` configured. The camera server can
+    use these features for image preprocessing.
+
+    Image values (numpy arrays) are excluded because they are not JSON-serializable
+    and the camera server already captures images independently.
+
+    Args:
+        robot: The robot whose cameras are checked.
+        obs: The (processed) robot observation dict from ``robot.get_observation()``.
+    """
+    import numpy as np
+
+    from lerobot.cameras.zmq import ZMQCamera
+
+    if not hasattr(robot, "cameras"):
+        return
+
+    # Filter out image arrays - only keep scalar/vector sensor readings
+    features = {
+        k: v.tolist() if isinstance(v, np.ndarray) and v.ndim <= 1 else v
+        for k, v in obs.items()
+        if not (isinstance(v, np.ndarray) and v.ndim > 1)
+    }
+
+    for cam in robot.cameras.values():
+        if isinstance(cam, ZMQCamera):
+            cam.send_features(features)
+
+
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -365,6 +398,9 @@ def record_loop(
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
+
+        # Send non-image observations to ZMQ camera servers for image preprocessing
+        _send_features_to_zmq_cameras(robot, obs_processed)
 
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
