@@ -22,16 +22,19 @@ Connects to a running :class:`ImageServer` over ZMQ, receives JPEG frames and
 displays them in an OpenCV window using ``cv2.imshow``.  Press **q** or
 **Escape** to quit.
 
+Keyboard controls:
+  - **q** / **Escape** – quit
+  - **r** – send ``recording_start`` event
+  - **s** – send ``recording_stop`` event
+  - **e** – send ``episode_end`` event
+
 Usage example::
 
     # On the robot / server machine:
-    python -m lerobot.cameras.zmq.image_server --host 0.0.0.0 --port 5555
+    python -m lerobot.cameras.zmq.image_server --host 0.0.0.0 --port 5555 --event-port 5556
 
     # On the client / viewer machine:
-    python -m lerobot.cameras.zmq.image_server_client --host 192.168.1.100 --port 5555
-
-    # Or via the installed script:
-    lerobot-image-server-client --host 192.168.1.100 --port 5555
+    python -m lerobot.cameras.zmq.image_server_client --host 192.168.1.100 --port 5555 --event-port 5556
 """
 
 import argparse
@@ -45,6 +48,26 @@ import zmq
 
 logger = logging.getLogger(__name__)
 
+# Key bindings for sending events
+EVENT_KEY_MAP = {
+    ord("r"): "recording_start",
+    ord("s"): "recording_stop",
+    ord("e"): "episode_end",
+}
+
+
+def _send_event(event_socket: zmq.Socket | None, event_type: str) -> None:
+    """Send a JSON event message to the server via ZMQ PUSH socket."""
+    if event_socket is None:
+        logger.warning("No event socket configured – ignoring key press.")
+        return
+    payload = json.dumps({"event": event_type, "timestamp": time.time()})
+    try:
+        event_socket.send_string(payload, zmq.NOBLOCK)
+        logger.info(f"Sent event: {event_type}")
+    except zmq.Again:
+        logger.warning(f"Event socket buffer full, could not send: {event_type}")
+
 
 def run_client(
     host: str = "localhost",
@@ -52,6 +75,7 @@ def run_client(
     camera_name: str | None = None,
     timeout_ms: int = 5000,
     window_title: str = "ZMQ Image Server",
+    event_port: int | None = None,
 ) -> None:
     """Connect to an :class:`ImageServer` and display frames with ``cv2.imshow``.
 
@@ -64,18 +88,32 @@ def run_client(
             (default: ``5000``).
         window_title: Title of the OpenCV display window (default:
             ``"ZMQ Image Server"``).
+        event_port: ZMQ PUSH port for sending recording events to the server
+            (default: *None* – no event sending).
     """
     context = zmq.Context()
+
+    # SUB socket for receiving frames
     socket = context.socket(zmq.SUB)
     socket.setsockopt_string(zmq.SUBSCRIBE, "")
     socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    # socket.setsockopt(zmq.CONFLATE, True)
     socket.connect(f"tcp://{host}:{port}")
+
+    # Optional PUSH socket for sending events
+    event_socket: zmq.Socket | None = None
+    if event_port is not None:
+        event_socket = context.socket(zmq.PUSH)
+        event_socket.setsockopt(zmq.LINGER, 0)
+        event_socket.setsockopt(zmq.SNDHWM, 10)
+        event_socket.connect(f"tcp://{host}:{event_port}")
+        logger.info(f"Event socket connected to tcp://{host}:{event_port}")
+        logger.info("Keys: [r] recording_start  [s] recording_stop  [e] episode_end")
 
     logger.info(f"Connected to tcp://{host}:{port}. Press 'q' or Escape to quit.")
 
     frame_count = 0
     fps_start = time.time()
+    recording = False
 
     try:
         while True:
@@ -84,6 +122,14 @@ def run_client(
             except zmq.Again:
                 logger.warning(f"No frame received within {timeout_ms} ms, retrying…")
                 continue
+
+            # Drain buffer: keep only the latest message
+            while True:
+                try:
+                    newer = socket.recv_multipart(zmq.NOBLOCK)
+                    parts = newer
+                except zmq.Again:
+                    break
 
             # Decode frame --------------------------------------------------
             if len(parts) > 1:
@@ -137,27 +183,56 @@ def run_client(
             else:
                 fps = frame_count / max(elapsed, 1e-6)
 
+            # Status overlay
+            status_text = f"{active_camera}  {fps:.1f} FPS"
+            if recording:
+                status_text += "  [REC]"
+            status_color = (0, 0, 255) if recording else (0, 255, 0)
+
             cv2.putText(
                 frame,
-                f"{active_camera}  {fps:.1f} FPS",
+                status_text,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (0, 255, 0),
+                status_color,
                 2,
                 cv2.LINE_AA,
             )
+
+            # Key hints when event port is configured
+            if event_socket is not None:
+                cv2.putText(
+                    frame,
+                    "[r] rec start  [s] rec stop  [e] episode end",
+                    (10, frame.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 200, 200),
+                    1,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow(window_title, frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):  # 'q' or Escape
                 break
+            elif key in EVENT_KEY_MAP:
+                event_type = EVENT_KEY_MAP[key]
+                _send_event(event_socket, event_type)
+                # Track recording state for overlay
+                if event_type == "recording_start":
+                    recording = True
+                elif event_type == "recording_stop":
+                    recording = False
 
     except KeyboardInterrupt:
         pass
     finally:
         cv2.destroyAllWindows()
+        if event_socket is not None:
+            event_socket.close()
         socket.close()
         context.term()
         logger.info("Client stopped.")
@@ -204,6 +279,15 @@ def main() -> None:
         help="Title of the OpenCV display window (default: 'ZMQ Image Server')",
     )
     parser.add_argument(
+        "--event-port",
+        type=int,
+        default=None,
+        help=(
+            "ZMQ PUSH port for sending recording events to the server. "
+            "Keys: [r] recording_start, [s] recording_stop, [e] episode_end (optional)"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -223,6 +307,7 @@ def main() -> None:
         camera_name=args.camera_name,
         timeout_ms=args.timeout_ms,
         window_title=args.window_title,
+        event_port=args.event_port,
     )
 
 
