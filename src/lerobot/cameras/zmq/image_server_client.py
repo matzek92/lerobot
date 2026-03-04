@@ -69,7 +69,7 @@ def run_client(
     socket = context.socket(zmq.SUB)
     socket.setsockopt_string(zmq.SUBSCRIBE, "")
     socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    socket.setsockopt(zmq.CONFLATE, True)
+    # socket.setsockopt(zmq.CONFLATE, True)
     socket.connect(f"tcp://{host}:{port}")
 
     logger.info(f"Connected to tcp://{host}:{port}. Press 'q' or Escape to quit.")

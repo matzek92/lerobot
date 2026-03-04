@@ -84,6 +84,7 @@ class ImageServer:
         self.socket = self.context.socket(zmq.PUB)
         self.socket.setsockopt(zmq.SNDHWM, 20)
         self.socket.setsockopt(zmq.LINGER, 0)
+        # self.socket.setsockopt(zmq.CONFLATE, 1)  # Keep only latest message
         self.socket.bind(f"tcp://{bind_host}:{port}")
 
         # Optional ZMQ PULL socket for receiving recording event notifications
