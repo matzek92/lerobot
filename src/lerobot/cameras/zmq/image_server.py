@@ -28,6 +28,7 @@ Protocol (version 2):
 The server uses ``socket.send_multipart([meta_bytes, jpeg1, jpeg2, ...])``.
 """
 
+import argparse
 import contextlib
 import json
 import logging
@@ -51,7 +52,14 @@ def encode_image(image: np.ndarray, quality: int = 80) -> bytes:
 
 
 class ImageServer:
-    def __init__(self, config: dict, port: int = 5555, event_port: int | None = None, features_port: int | None = None):
+    def __init__(
+        self,
+        config: dict,
+        host: str = "*",
+        port: int = 5555,
+        event_port: int | None = None,
+        features_port: int | None = None,
+    ):
         self.fps = config.get("fps", 30)
         self.cameras: dict[str, OpenCVCamera] = {}
 
@@ -69,19 +77,21 @@ class ImageServer:
             self.cameras[name] = camera
             logger.info(f"Camera {name}: {shape[1]}x{shape[0]}")
 
+        bind_host = host
+
         # ZMQ PUB socket
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.setsockopt(zmq.SNDHWM, 20)
         self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.bind(f"tcp://*:{port}")
+        self.socket.bind(f"tcp://{bind_host}:{port}")
 
         # Optional ZMQ PULL socket for receiving recording event notifications
         self.event_socket: zmq.Socket | None = None
         if event_port is not None:
             self.event_socket = self.context.socket(zmq.PULL)
             self.event_socket.setsockopt(zmq.LINGER, 0)
-            self.event_socket.bind(f"tcp://*:{event_port}")
+            self.event_socket.bind(f"tcp://{bind_host}:{event_port}")
             logger.info(f"ImageServer event listener on port {event_port}")
 
         # Optional ZMQ PULL socket for receiving robot features and sensor readings
@@ -90,10 +100,10 @@ class ImageServer:
         if features_port is not None:
             self.features_socket = self.context.socket(zmq.PULL)
             self.features_socket.setsockopt(zmq.LINGER, 0)
-            self.features_socket.bind(f"tcp://*:{features_port}")
+            self.features_socket.bind(f"tcp://{bind_host}:{features_port}")
             logger.info(f"ImageServer features listener on port {features_port}")
 
-        logger.info(f"ImageServer running on port {port}")
+        logger.info(f"ImageServer running on {bind_host}:{port}")
 
     def _handle_events(self) -> None:
         """Process any pending recording event notifications (non-blocking)."""
@@ -182,7 +192,92 @@ class ImageServer:
             self.context.term()
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stream camera images over ZMQ using a multipart binary protocol.",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Camera device index or path (default: 0)",
+    )
+    parser.add_argument(
+        "--camera-name",
+        type=str,
+        default="head_camera",
+        help="Name to assign to the camera stream (default: head_camera)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="Frames per second (default: 30)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=640,
+        help="Frame width in pixels (default: 640)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=480,
+        help="Frame height in pixels (default: 480)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="*",
+        help="IP address or hostname to bind to (default: * for all interfaces)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5555,
+        help="ZMQ PUB socket port for publishing frames (default: 5555)",
+    )
+    parser.add_argument(
+        "--event-port",
+        type=int,
+        default=None,
+        help="ZMQ PULL socket port for receiving recording event notifications (optional)",
+    )
+    parser.add_argument(
+        "--features-port",
+        type=int,
+        default=None,
+        help="ZMQ PULL socket port for receiving robot features/sensor readings (optional)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level))
+
+    config = {
+        "fps": args.fps,
+        "cameras": {
+            args.camera_name: {
+                "device_id": args.camera_index,
+                "shape": [args.height, args.width],
+            }
+        },
+    }
+    ImageServer(
+        config,
+        host=args.host,
+        port=args.port,
+        event_port=args.event_port,
+        features_port=args.features_port,
+    ).run()
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    config = {"fps": 30, "cameras": {"head_camera": {"device_id": 4, "shape": [480, 640]}}}
-    ImageServer(config, port=5555).run()
+    main()

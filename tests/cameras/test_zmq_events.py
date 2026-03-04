@@ -550,3 +550,106 @@ class TestEncodeImage:
         assert decoded is not None
         assert decoded.shape[2] == 3
 
+
+# ---------------------------------------------------------------------------
+# ImageServer CLI (argparse) tests
+# ---------------------------------------------------------------------------
+
+class TestImageServerCLI:
+    """Tests for the image_server CLI argument parsing via main()."""
+
+    def _parse_args(self, argv: list[str]):
+        """Run main() with patched argv and capture the config/kwargs passed to ImageServer."""
+        from unittest.mock import patch
+
+        # We only want to test argument parsing, not actually start the server.
+        captured = {}
+
+        class _FakeServer:
+            def __init__(self, config, host="*", port=5555, event_port=None, features_port=None):
+                captured["config"] = config
+                captured["host"] = host
+                captured["port"] = port
+                captured["event_port"] = event_port
+                captured["features_port"] = features_port
+
+            def run(self):
+                pass
+
+        with patch("lerobot.cameras.zmq.image_server.ImageServer", _FakeServer):
+            with patch("sys.argv", ["image_server"] + argv):
+                from lerobot.cameras.zmq.image_server import main
+                main()
+
+        return captured
+
+    def test_defaults(self):
+        captured = self._parse_args([])
+        assert captured["host"] == "*"
+        assert captured["port"] == 5555
+        assert captured["event_port"] is None
+        assert captured["features_port"] is None
+        config = captured["config"]
+        assert config["fps"] == 30
+        cameras = config["cameras"]
+        assert "head_camera" in cameras
+        cam = cameras["head_camera"]
+        assert cam["device_id"] == 0
+        assert cam["shape"] == [480, 640]
+
+    def test_custom_camera_index(self):
+        captured = self._parse_args(["--camera-index", "4"])
+        assert captured["config"]["cameras"]["head_camera"]["device_id"] == 4
+
+    def test_custom_camera_name(self):
+        captured = self._parse_args(["--camera-name", "wrist_camera"])
+        assert "wrist_camera" in captured["config"]["cameras"]
+
+    def test_custom_fps(self):
+        captured = self._parse_args(["--fps", "60"])
+        assert captured["config"]["fps"] == 60
+
+    def test_custom_width_and_height(self):
+        captured = self._parse_args(["--width", "1280", "--height", "720"])
+        shape = captured["config"]["cameras"]["head_camera"]["shape"]
+        assert shape == [720, 1280]
+
+    def test_custom_host(self):
+        captured = self._parse_args(["--host", "192.168.1.10"])
+        assert captured["host"] == "192.168.1.10"
+
+    def test_custom_port(self):
+        captured = self._parse_args(["--port", "6000"])
+        assert captured["port"] == 6000
+
+    def test_event_port(self):
+        captured = self._parse_args(["--event-port", "5556"])
+        assert captured["event_port"] == 5556
+
+    def test_features_port(self):
+        captured = self._parse_args(["--features-port", "5557"])
+        assert captured["features_port"] == 5557
+
+    def test_all_args_combined(self):
+        captured = self._parse_args([
+            "--camera-index", "2",
+            "--camera-name", "side_cam",
+            "--fps", "15",
+            "--width", "320",
+            "--height", "240",
+            "--host", "0.0.0.0",
+            "--port", "7000",
+            "--event-port", "7001",
+            "--features-port", "7002",
+        ])
+        assert captured["host"] == "0.0.0.0"
+        assert captured["port"] == 7000
+        assert captured["event_port"] == 7001
+        assert captured["features_port"] == 7002
+        config = captured["config"]
+        assert config["fps"] == 15
+        cam = config["cameras"]["side_cam"]
+        assert cam["device_id"] == 2
+        assert cam["shape"] == [240, 320]
+
+
