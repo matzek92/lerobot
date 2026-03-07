@@ -290,6 +290,151 @@ def test_trim_negative_values(sample_dataset, tmp_path):
         )
 
 
+def test_trim_episodes_append_to_existing_dataset(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that trimmed episodes are correctly appended to an existing dataset."""
+    # Build a small target dataset with 2 episodes of 10 frames each.
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for ep_idx in range(2):
+        for _ in range(10):
+            frame = {
+                "action": np.random.randn(6).astype(np.float32),
+                "observation.state": np.random.randn(4).astype(np.float32),
+                "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+                "task": "task_target",
+            }
+            target_dataset.add_frame(frame)
+        target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # sample_dataset has 5 episodes × 10 frames. Trim episode 0 by [2, 3] → 5 frames.
+    # All 5 episodes are appended to target (which already has 2 episodes × 10 frames).
+    result = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (2, 3)},
+        append_to_dataset=target_dataset,
+    )
+
+    # target had 2 eps × 10 = 20 frames; source contributes 5 + 4×10 = 45 frames
+    assert result is target_dataset
+    assert result.meta.total_episodes == 7   # 2 existing + 5 appended
+    assert result.meta.total_frames == 65    # 20 existing + 45 appended
+    assert len(result) == 65
+
+    # Episode indices should be contiguous 0..6
+    episode_indices = sorted({int(idx.item()) for idx in result.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(7))
+
+
+def test_trim_episodes_append_feature_mismatch(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that appending to a dataset with different features raises an error."""
+    different_features = {
+        "action": {"dtype": "float32", "shape": (3,), "names": None},  # different shape
+    }
+    other_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "other",
+        features=different_features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(3).astype(np.float32),
+            "task": "task_other",
+        }
+        other_dataset.add_frame(frame)
+    other_dataset.save_episode()
+    other_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Feature mismatch"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (1, 0)},
+            append_to_dataset=other_dataset,
+        )
+
+
+def test_trim_episodes_append_conflicts_with_output_dir(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that specifying both append_to_dataset and output_dir raises an error."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target2",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "task_t",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Cannot specify 'output_dir' or 'repo_id' together with"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (1, 0)},
+            output_dir=tmp_path / "conflict",
+            append_to_dataset=target_dataset,
+        )
+
+
+def test_trim_episodes_append_incremental(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test two sequential append operations (simulate incremental workflow)."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target_incr",
+        features=features,
+    )
+    # 1 episode × 10 frames as base
+    for _ in range(10):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "base_task",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # First incremental append: trim episode 0 (3 frames removed) → 7 frames appended
+    trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (3, 0)},
+        append_to_dataset=target_dataset,
+    )
+    # After first append: 1 + 5 = 6 episodes, 10 + 7 + 4×10 = 57 frames
+    assert target_dataset.meta.total_episodes == 6
+    assert target_dataset.meta.total_frames == 57
+
+    # Second incremental append: trim episode 4 only (2+1=3 removed) → 7 frames appended
+    # Note: sample_dataset still has 5 episodes; episode 4 has 10 frames
+    trim_episodes(
+        sample_dataset,
+        episode_trim_specs={4: (2, 1)},
+        append_to_dataset=target_dataset,
+    )
+    # After second append: 6 + 5 = 11 episodes, 57 + 7 + 4×10 = 104 frames
+    assert target_dataset.meta.total_episodes == 11
+    assert target_dataset.meta.total_frames == 104
+
+
 def test_split_by_episodes(sample_dataset, tmp_path):
     """Test splitting dataset by specific episode indices."""
     splits = {

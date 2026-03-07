@@ -108,6 +108,47 @@ lerobot-edit-dataset \
 **Note:** Because `--new_repo_id` is required (the result is written to a fresh dataset),
 the original dataset is never modified.
 
+##### Appending trimmed episodes to an existing dataset
+
+Use `--operation.append_to_repo_id` instead of `--new_repo_id` to append the trimmed
+episodes to an **already existing** dataset instead of creating a new one.  This
+supports two important use-cases:
+
+1. **Merging material from similar datasets** — process several source datasets one
+   after the other, accumulating all trimmed results into a single target dataset.
+2. **Incremental / interrupted workflows** — stop after processing some episodes, then
+   resume and append the remaining episodes in a later run.
+
+```bash
+# ── Session 1: process the first source dataset and create the target ──────
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht_a \
+    --new_repo_id lerobot/pusht_combined \
+    --operation.type trim_episodes \
+    --operation.episode_trim_specs '{"0": [5, 3], "1": [2, 0]}'
+
+# ── Session 2: append episodes from a second source to the same target ──────
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht_b \
+    --operation.type trim_episodes \
+    --operation.episode_trim_specs '{"0": [4, 2]}' \
+    --operation.append_to_repo_id lerobot/pusht_combined
+
+# ── Session 3: append more episodes from yet another source ─────────────────
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht_c \
+    --operation.type trim_episodes \
+    --operation.episode_trim_specs '{"2": [1, 1]}' \
+    --operation.append_to_repo_id lerobot/pusht_combined
+```
+
+**Requirements for appending:**
+
+- The source and target datasets must have the **same features** (same feature keys) and
+  the **same FPS**.
+- `--operation.append_to_repo_id` and `--new_repo_id` are mutually exclusive.
+- The original source dataset is never modified.
+
 #### Split Dataset
 
 Divide a dataset into multiple subsets.

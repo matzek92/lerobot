@@ -55,6 +55,13 @@ Trim episodes and use the visualization tool to find cut boundaries first:
         --operation.type trim_episodes \
         --operation.episode_trim_specs '{"0": [10, 5]}'
 
+Append trimmed episodes from a source dataset to an existing target dataset (incremental workflow):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [5, 3]}' \
+        --operation.append_to_repo_id lerobot/pusht_existing
+
 Split dataset by fractions:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -178,6 +185,9 @@ class TrimEpisodesConfig(OperationConfig):
     # always produces string dict keys.  They are converted to int in
     # handle_trim_episodes before being passed to trim_episodes().
     episode_trim_specs: dict[str, tuple[int, int]] | None = None
+    # When set, trimmed episodes are appended to this existing repo instead of
+    # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
+    append_to_repo_id: str | None = None
 
 
 @OperationConfig.register_subclass("delete_episodes")
@@ -303,33 +313,62 @@ def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
             '\'{"0": [5, 3], "2": [2, 0]}\''
         )
 
-    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
-    output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
-    )
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
 
-    if cfg.new_repo_id is None:
-        dataset.root = Path(str(dataset.root) + "_old")
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
 
     # Convert string keys to int (CLI args come in as strings)
     episode_trim_specs: dict[int, tuple[int, int]] = {}
     for k, v in cfg.operation.episode_trim_specs.items():
         episode_trim_specs[int(k)] = (int(v[0]), int(v[1]))
 
-    logging.info(f"Trimming episodes {list(episode_trim_specs.keys())} in {cfg.repo_id}")
-    new_dataset = trim_episodes(
-        dataset,
-        episode_trim_specs=episode_trim_specs,
-        output_dir=output_dir,
-        repo_id=output_repo_id,
+    if cfg.operation.append_to_repo_id is not None:
+        # Append mode: load the target dataset and append trimmed episodes to it.
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending trimmed episodes from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            append_to_dataset=append_to_dataset,
+        )
+
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        # Normal mode: write trimmed output to a new (or in-place replaced) dataset.
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(f"Trimming episodes {list(episode_trim_specs.keys())} in {cfg.repo_id}")
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+        )
+
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
     )
 
-    logging.info(f"Dataset saved to {output_dir}")
-    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
-
     if cfg.push_to_hub:
-        logging.info(f"Pushing to hub as {output_repo_id}")
-        new_dataset.push_to_hub()
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
 
 
 def handle_split(cfg: EditDatasetConfig) -> None:
