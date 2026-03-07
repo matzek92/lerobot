@@ -174,6 +174,9 @@ class OperationConfig(draccus.ChoiceRegistry, abc.ABC):
 @OperationConfig.register_subclass("trim_episodes")
 @dataclass
 class TrimEpisodesConfig(OperationConfig):
+    # Keys are episode indices as strings because JSON/CLI argument parsing
+    # always produces string dict keys.  They are converted to int in
+    # handle_trim_episodes before being passed to trim_episodes().
     episode_trim_specs: dict[str, tuple[int, int]] | None = None
 
 

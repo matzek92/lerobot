@@ -607,9 +607,11 @@ def _trim_and_reindex_data(
             # Reset frame_index to start from 0 within the episode
             ep_df["frame_index"] = range(len(ep_df))
 
-            # Subtract the trimmed start time so timestamps begin at 0
+            # Use the actual first kept frame's timestamp as the reference so that
+            # timestamps always start at 0 regardless of irregular frame spacing.
             if trim_start > 0:
-                ep_df["timestamp"] = ep_df["timestamp"] - trim_start / src_dataset.meta.fps
+                start_ts = ep_df["timestamp"].iloc[0]
+                ep_df["timestamp"] = ep_df["timestamp"] - start_ts
 
             # Remap task indices
             ep_df["task_index"] = ep_df["task_index"].replace(task_mapping)
@@ -777,9 +779,15 @@ def _save_trimmed_episodes_metadata(
     """Save episode metadata for a trimmed dataset.
 
     Similar to _copy_and_reindex_episodes_metadata but uses the new episode length
-    (after trimming) when writing metadata. Per-episode statistics from the source
-    dataset are used as-is for non-trimmed episodes; for trimmed episodes, the original
-    stats are reused as an approximation (minor inaccuracy for small trims).
+    (after trimming) when writing metadata.
+
+    Note on statistics: Per-episode statistics (mean, std, min, max) are copied from
+    the source dataset as-is for all episodes.  For trimmed episodes these figures
+    are based on the full original episode and may be slightly inaccurate.  For most
+    use-cases (e.g. normalisation during training) the difference is negligible when
+    only a small number of frames is trimmed.  The ``count`` statistic is updated to
+    reflect the actual trimmed length so that weighted aggregation across episodes
+    remains correct.
 
     Args:
         src_dataset: Source dataset to read metadata from.
@@ -809,8 +817,6 @@ def _save_trimmed_episodes_metadata(
         new_length = src_episode["length"] - trim_start - trim_end
 
         # Extract and normalise per-episode statistics from parquet metadata.
-        # For trimmed episodes these will be slightly inaccurate (based on the
-        # full-episode data) but are sufficient for normalisation purposes.
         # Note: same nested-array fix as in _copy_and_reindex_episodes_metadata.
         episode_stats = {}
         for key in src_episode_full:
@@ -837,7 +843,8 @@ def _save_trimmed_episodes_metadata(
                             elif isinstance(value, np.ndarray) and value.shape == (3,):
                                 value = value.reshape(3, 1, 1)
 
-                    # Adjust count to reflect the trimmed episode length
+                    # Update count to reflect the trimmed length so that weighted
+                    # aggregation in aggregate_stats uses the correct sample sizes.
                     if stat_name == "count":
                         value = np.array([new_length])
 

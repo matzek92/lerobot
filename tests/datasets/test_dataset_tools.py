@@ -143,6 +143,15 @@ def test_delete_empty_list(sample_dataset, tmp_path):
         )
 
 
+def _get_episode_frame_indices(dataset, ep_idx):
+    """Return the dataset-level indices for all frames belonging to ep_idx."""
+    return [
+        i
+        for i in range(len(dataset))
+        if int(dataset.hf_dataset["episode_index"][i].item()) == ep_idx
+    ]
+
+
 def test_trim_single_episode_start(sample_dataset, tmp_path):
     """Test trimming frames from the start of a single episode."""
     output_dir = tmp_path / "trimmed"
@@ -166,9 +175,7 @@ def test_trim_single_episode_start(sample_dataset, tmp_path):
     assert len(new_dataset) == 47
 
     # Episode 0 should now have 7 frames
-    ep0_frames = [
-        i for i in range(len(new_dataset)) if int(new_dataset.hf_dataset["episode_index"][i].item()) == 0
-    ]
+    ep0_frames = _get_episode_frame_indices(new_dataset, 0)
     assert len(ep0_frames) == 7
 
     # frame_index for episode 0 should start at 0
@@ -228,9 +235,7 @@ def test_trim_single_episode_both_ends(sample_dataset, tmp_path):
     assert new_dataset.meta.total_frames == 45
 
     # Episode 1 should have 5 frames
-    ep1_frames = [
-        i for i in range(len(new_dataset)) if int(new_dataset.hf_dataset["episode_index"][i].item()) == 1
-    ]
+    ep1_frames = _get_episode_frame_indices(new_dataset, 1)
     assert len(ep1_frames) == 5
 
 
