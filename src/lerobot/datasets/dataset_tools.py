@@ -45,6 +45,7 @@ from lerobot.datasets.utils import (
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
+    DEFAULT_FEATURES,
     get_parquet_file_size_in_mb,
     load_episodes,
     update_chunk_file_indices,
@@ -52,7 +53,7 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import encode_video_frames, get_video_info
+from lerobot.datasets.video_utils import decode_video_frames, encode_video_frames, get_video_info
 from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
 
 
@@ -139,6 +140,221 @@ def delete_episodes(
 
     logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
     return new_dataset
+
+
+def trim_episodes(
+    dataset: LeRobotDataset,
+    episode_trim_specs: dict[int, tuple[int, int]],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
+) -> LeRobotDataset:
+    """Trim frames from the beginning and/or end of episodes in a dataset.
+
+    Creates a new dataset where specified episodes have frames removed from their
+    start and/or end. This function uses the same ``add_frame`` / ``save_episode``
+    / ``finalize`` mechanism as ``lerobot record``, so the v3 format's multi-episode
+    video/parquet containers are managed automatically by the framework.
+
+    Episodes not listed in *episode_trim_specs* are copied unchanged.
+
+    When *append_to_dataset* is provided the trimmed episodes are **appended to that
+    existing dataset** rather than written to a new one.  This enables an incremental
+    workflow where you process multiple source datasets in separate runs and accumulate
+    all results in a single target dataset.
+
+    Args:
+        dataset: The source LeRobotDataset.
+        episode_trim_specs: Dict mapping episode index to (trim_start_frames, trim_end_frames).
+            ``trim_start_frames``: Number of frames to remove from the beginning of the episode.
+            ``trim_end_frames``: Number of frames to remove from the end of the episode.
+            Episodes not in this dict are kept as-is.
+        output_dir: Directory to save the new dataset. Ignored when *append_to_dataset* is given.
+            If None and no append target, uses default location based on *repo_id*.
+        repo_id: Repository ID for the new dataset. Ignored when *append_to_dataset* is given.
+            If None and no append target, appends "_trimmed" to the source repo_id.
+        append_to_dataset: When provided, trimmed episodes are appended to this existing dataset
+            rather than written to a new one.  *output_dir* and *repo_id* must be ``None`` when
+            this argument is used.  The source and target datasets must have identical user-defined
+            features and the same FPS.
+
+    Returns:
+        :class:`LeRobotDataset` containing the trimmed episodes — either the newly created dataset
+        or the updated *append_to_dataset* target.
+
+    Example::
+
+        # Trim 5 frames from start and 3 from end of episode 0,
+        # and 2 frames from start of episode 2
+        new_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs={0: (5, 3), 2: (2, 0)},
+            output_dir="./output",
+        )
+
+        # Append trimmed episodes to an existing dataset instead of creating a new one
+        target = LeRobotDataset("my_repo", root="./target")
+        trim_episodes(
+            dataset,
+            episode_trim_specs={0: (5, 3)},
+            append_to_dataset=target,
+        )
+    """
+    if not episode_trim_specs:
+        raise ValueError("No trim specifications provided")
+
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'. "
+            "When appending to an existing dataset, the output directory is determined by that dataset."
+        )
+
+    valid_indices = set(range(dataset.meta.total_episodes))
+    invalid = set(episode_trim_specs.keys()) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.meta.root)
+
+    for ep_idx, (trim_start, trim_end) in episode_trim_specs.items():
+        if trim_start < 0 or trim_end < 0:
+            raise ValueError(f"Trim values must be non-negative for episode {ep_idx}")
+        ep_length = dataset.meta.episodes[ep_idx]["length"]
+        if trim_start + trim_end >= ep_length:
+            raise ValueError(
+                f"Cannot trim {trim_start + trim_end} frames from episode {ep_idx} "
+                f"with length {ep_length}. Result would have no frames."
+            )
+
+    logging.info(f"Trimming {len(episode_trim_specs)} episodes in dataset")
+
+    # Feature dict without the default system features (they are re-added by create()).
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
+    if append_to_dataset is not None:
+        # Validate feature compatibility between source and target.
+        target_user_features = {
+            k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
+        }
+        if set(user_features.keys()) != set(target_user_features.keys()):
+            raise ValueError(
+                f"Feature mismatch between source dataset and append target. "
+                f"Source has: {set(user_features.keys())}, "
+                f"Target has: {set(target_user_features.keys())}"
+            )
+        if dataset.meta.fps != append_to_dataset.meta.fps:
+            raise ValueError(
+                f"FPS mismatch: source dataset has {dataset.meta.fps} fps "
+                f"but target dataset has {append_to_dataset.meta.fps} fps"
+            )
+        # Enable write mode on the existing target dataset.
+        # The LeRobotDataset write machinery (add_frame / save_episode / finalize) already
+        # handles the "resume" case: when `latest_episode` is None but `meta.episodes` is
+        # non-empty, it picks up chunk/file indices from the last existing episode and starts
+        # a new parquet/video file without touching existing data.
+        #
+        # Safety note: if `latest_episode` is already set (e.g. this function was called before
+        # on the same Python object in the same process), the parquet writer machinery would
+        # re-open the last parquet file and overwrite its content.  We prevent that by setting
+        # `_writer_closed_for_reading = True` whenever a previous write session was detected
+        # (i.e. `latest_episode is not None`).  This flag makes `_save_episode_data` always
+        # move to a fresh parquet file for the first episode written in this new session.
+        if append_to_dataset.latest_episode is not None:
+            append_to_dataset._writer_closed_for_reading = True
+        append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+        write_target = append_to_dataset
+    else:
+        if repo_id is None:
+            repo_id = f"{dataset.repo_id}_trimmed"
+        output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+        # Create the output dataset using the same factory as lerobot record.
+        # The framework then handles v3 container packaging automatically.
+        write_target = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=dataset.meta.fps,
+            features=user_features,
+            robot_type=dataset.meta.robot_type,
+            root=output_dir,
+            use_videos=len(dataset.meta.video_keys) > 0,
+        )
+
+    # Make sure the source HF dataset is loaded before iterating.
+    dataset._ensure_hf_dataset_loaded()
+
+    has_video = len(dataset.meta.video_keys) > 0
+
+    for ep_idx in tqdm(range(dataset.meta.total_episodes), desc="Trimming episodes"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        trim_start, trim_end = episode_trim_specs.get(ep_idx, (0, 0))
+
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        kept_from_idx = from_idx + trim_start
+        kept_to_idx = to_idx - trim_end
+        kept_length = kept_to_idx - kept_from_idx
+
+        # Batch-decode all video frames for this episode at once.
+        # decode_video_frames accepts absolute timestamps within the video file.
+        video_frames: dict[str, np.ndarray] = {}
+        if has_video:
+            for vid_key in dataset.meta.video_keys:
+                from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+                # Absolute timestamps in the source video for each kept frame.
+                kept_timestamps = [
+                    from_ts + (trim_start + i) / dataset.fps for i in range(kept_length)
+                ]
+                video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+                # Returns (N, C, H, W) float32 tensor with values in [0, 1].
+                frames_tensor = decode_video_frames(
+                    video_path, kept_timestamps, dataset.tolerance_s, dataset.video_backend
+                )
+                video_frames[vid_key] = frames_tensor.numpy()  # (N, C, H, W) float32
+
+        # Feed frames one by one via the record-style add_frame API.
+        for i in range(kept_length):
+            abs_idx = kept_from_idx + i
+            # hf_dataset[idx] applies hf_transform_to_torch → returns torch tensors.
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+
+            # Required task string.
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            # Video features: CHW float32 [0, 1] numpy array.
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i]
+
+            # Image and numerical features.
+            for key, feat in user_features.items():
+                if feat["dtype"] == "video":
+                    continue
+                elif feat["dtype"] == "image":
+                    # hf_transform_to_torch converts PIL → CHW float32 [0, 1].
+                    # add_frame / write_image expects HWC uint8 [0, 255].
+                    frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    # Numerical: tensor → numpy (dtype is preserved by from_numpy).
+                    frame[key] = item[key].numpy()
+
+            write_target.add_frame(frame)
+
+        write_target.save_episode()
+
+    write_target.finalize()
+    # Reload the HF dataset from disk so the returned object is fully readable.
+    write_target._ensure_hf_dataset_loaded()
+
+    total_trimmed = sum(ts + te for ts, te in episode_trim_specs.values())
+    action = "Appended trimmed episodes to" if append_to_dataset is not None else "Created"
+    logging.info(
+        f"{action} trimmed dataset: {write_target.meta.total_episodes} episodes, "
+        f"{write_target.meta.total_frames} frames "
+        f"(removed {total_trimmed} frames from specified episodes)"
+    )
+    return write_target
 
 
 def split_dataset(
