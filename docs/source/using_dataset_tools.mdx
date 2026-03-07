@@ -7,19 +7,20 @@ This guide covers the dataset tools utilities available in LeRobot for modifying
 LeRobot provides several utilities for manipulating datasets:
 
 1. **Delete Episodes** - Remove specific episodes from a dataset
-2. **Split Dataset** - Divide a dataset into multiple smaller datasets
-3. **Merge Datasets** - Combine multiple datasets into one. The datasets must have identical features, and episodes are concatenated in the order specified in `repo_ids`
-4. **Add Features** - Add new features to a dataset
-5. **Remove Features** - Remove features from a dataset
-6. **Convert to Video** - Convert image-based datasets to video format for efficient storage
-7. **Show the Info of Datasets** - Show the summary of datasets information such as number of episode etc.
+2. **Trim Episodes** - Remove frames from the start and/or end of specific episodes
+3. **Split Dataset** - Divide a dataset into multiple smaller datasets
+4. **Merge Datasets** - Combine multiple datasets into one. The datasets must have identical features, and episodes are concatenated in the order specified in `repo_ids`
+5. **Add Features** - Add new features to a dataset
+6. **Remove Features** - Remove features from a dataset
+7. **Convert to Video** - Convert image-based datasets to video format for efficient storage
+8. **Show the Info of Datasets** - Show the summary of datasets information such as number of episode etc.
 
 The core implementation is in `lerobot.datasets.dataset_tools`.
 An example script detailing how to use the tools API is available in `examples/dataset/use_dataset_tools.py`.
 
 ## Command-Line Tool: lerobot-edit-dataset
 
-`lerobot-edit-dataset` is a command-line script for editing datasets. It can be used to delete episodes, split datasets, merge datasets, add features, remove features, and convert image datasets to video format.
+`lerobot-edit-dataset` is a command-line script for editing datasets. It can be used to delete episodes, trim episodes, split datasets, merge datasets, add features, remove features, and convert image datasets to video format.
 
 Run `lerobot-edit-dataset --help` for more information on the configuration of each operation.
 
@@ -43,6 +44,69 @@ lerobot-edit-dataset \
     --operation.type delete_episodes \
     --operation.episode_indices "[0, 2, 5]"
 ```
+
+#### Trim Episodes
+
+Remove a fixed number of frames from the **start** and/or **end** of specific episodes.
+This is particularly useful to cut away the robot arm approaching the workspace at the
+beginning, or retracting at the end of a trajectory.
+
+The operation creates a new dataset in the v3 format — multi-episode video containers
+are rebuilt automatically by the framework, so the result is always a valid v3 dataset.
+
+**Recommended workflow:**
+
+1. Visualise the episode you want to trim to find the exact frame indices:
+
+```bash
+lerobot-dataset-viz \
+    --repo-id lerobot/pusht \
+    --episode-index 0
+```
+
+   The visualizer shows the `frame_index` value for each frame in the episode.
+   Note down the first *good* frame (trim_start) and the last *bad* frame counted from
+   the end (trim_end).
+
+2. Trim the identified episodes:
+
+```bash
+# Trim episode 0: remove the first 10 frames and the last 5 frames.
+# All other episodes are copied unchanged.
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht \
+    --new_repo_id lerobot/pusht_trimmed \
+    --operation.type trim_episodes \
+    --operation.episode_trim_specs '{"0": [10, 5]}'
+
+# Trim multiple episodes with different cut points:
+#   episode 0 → drop first 5, last 3
+#   episode 2 → drop first 2 only
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht \
+    --new_repo_id lerobot/pusht_trimmed \
+    --operation.type trim_episodes \
+    --operation.episode_trim_specs '{"0": [5, 3], "2": [2, 0]}'
+```
+
+**Format of `--operation.episode_trim_specs`:**
+
+```
+'{"<episode_index>": [<trim_start_frames>, <trim_end_frames>], ...}'
+```
+
+| Field | Meaning |
+|---|---|
+| `episode_index` | Zero-based episode number (as a string in JSON) |
+| `trim_start_frames` | Number of frames to drop from the **beginning** of the episode |
+| `trim_end_frames` | Number of frames to drop from the **end** of the episode |
+
+- Episodes not listed in `episode_trim_specs` are copied unchanged.
+- `trim_start_frames + trim_end_frames` must be strictly less than the episode length.
+- Both values must be ≥ 0.
+
+**Note:** Because `--new_repo_id` is required (the result is written to a fresh dataset),
+the original dataset is never modified.
 
 #### Split Dataset
 
