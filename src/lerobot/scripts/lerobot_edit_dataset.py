@@ -329,7 +329,7 @@ def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
 
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
-        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+        new_dataset.push_to_hub()
 
 
 def handle_split(cfg: EditDatasetConfig) -> None:

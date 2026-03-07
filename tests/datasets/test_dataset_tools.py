@@ -156,18 +156,11 @@ def test_trim_single_episode_start(sample_dataset, tmp_path):
     """Test trimming frames from the start of a single episode."""
     output_dir = tmp_path / "trimmed"
 
-    with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
-    ):
-        mock_get_safe_version.return_value = "v3.0"
-        mock_snapshot_download.return_value = str(output_dir)
-
-        new_dataset = trim_episodes(
-            sample_dataset,
-            episode_trim_specs={0: (3, 0)},
-            output_dir=output_dir,
-        )
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (3, 0)},
+        output_dir=output_dir,
+    )
 
     # 5 episodes, episode 0 trimmed by 3 from start → 7 + 4*10 = 47 frames
     assert new_dataset.meta.total_episodes == 5
@@ -195,18 +188,11 @@ def test_trim_single_episode_end(sample_dataset, tmp_path):
     """Test trimming frames from the end of a single episode."""
     output_dir = tmp_path / "trimmed"
 
-    with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
-    ):
-        mock_get_safe_version.return_value = "v3.0"
-        mock_snapshot_download.return_value = str(output_dir)
-
-        new_dataset = trim_episodes(
-            sample_dataset,
-            episode_trim_specs={2: (0, 4)},
-            output_dir=output_dir,
-        )
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={2: (0, 4)},
+        output_dir=output_dir,
+    )
 
     # 5 episodes, episode 2 trimmed by 4 from end → 6 + 4*10 = 46 frames
     assert new_dataset.meta.total_episodes == 5
@@ -217,18 +203,11 @@ def test_trim_single_episode_both_ends(sample_dataset, tmp_path):
     """Test trimming frames from both ends of a single episode."""
     output_dir = tmp_path / "trimmed"
 
-    with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
-    ):
-        mock_get_safe_version.return_value = "v3.0"
-        mock_snapshot_download.return_value = str(output_dir)
-
-        new_dataset = trim_episodes(
-            sample_dataset,
-            episode_trim_specs={1: (2, 3)},
-            output_dir=output_dir,
-        )
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={1: (2, 3)},
+        output_dir=output_dir,
+    )
 
     # 5 episodes, episode 1 trimmed by 5 total → 5 + 4*10 = 45 frames
     assert new_dataset.meta.total_episodes == 5
@@ -243,18 +222,11 @@ def test_trim_multiple_episodes(sample_dataset, tmp_path):
     """Test trimming multiple episodes at once."""
     output_dir = tmp_path / "trimmed"
 
-    with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
-    ):
-        mock_get_safe_version.return_value = "v3.0"
-        mock_snapshot_download.return_value = str(output_dir)
-
-        new_dataset = trim_episodes(
-            sample_dataset,
-            episode_trim_specs={0: (2, 1), 3: (1, 2)},
-            output_dir=output_dir,
-        )
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (2, 1), 3: (1, 2)},
+        output_dir=output_dir,
+    )
 
     # ep0: 10-3=7, ep3: 10-3=7, others: 10 each
     # Total: 7 + 10 + 10 + 7 + 10 = 44
@@ -266,19 +238,12 @@ def test_trim_all_episodes_same_spec(sample_dataset, tmp_path):
     """Test trimming all episodes by the same amount."""
     output_dir = tmp_path / "trimmed"
 
-    with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
-    ):
-        mock_get_safe_version.return_value = "v3.0"
-        mock_snapshot_download.return_value = str(output_dir)
-
-        specs = {i: (1, 1) for i in range(5)}
-        new_dataset = trim_episodes(
-            sample_dataset,
-            episode_trim_specs=specs,
-            output_dir=output_dir,
-        )
+    specs = {i: (1, 1) for i in range(5)}
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs=specs,
+        output_dir=output_dir,
+    )
 
     # Each episode: 10 - 2 = 8 frames → 5 * 8 = 40
     assert new_dataset.meta.total_episodes == 5
