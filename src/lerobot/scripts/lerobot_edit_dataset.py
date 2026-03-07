@@ -130,6 +130,23 @@ Convert image dataset to video format and push to hub:
         --operation.type convert_image_to_video \
         --push_to_hub true
 
+Add a guide stream (repeats the first frame of a camera throughout each episode):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_guide \
+        --operation.type add_guide_stream \
+        --operation.source_key observation.images.laptop \
+        --operation.new_key observation.images.guide_laptop
+
+Add a guide stream and push to hub:
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_guide \
+        --operation.type add_guide_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.guide_top \
+        --push_to_hub true
+
 Show dataset information:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
@@ -159,6 +176,7 @@ import draccus
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
     convert_image_to_video_dataset,
+    add_guide_stream,
     delete_episodes,
     merge_datasets,
     modify_tasks,
@@ -234,6 +252,24 @@ class ConvertImageToVideoConfig(OperationConfig):
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
+
+
+@OperationConfig.register_subclass("add_guide_stream")
+@dataclass
+class AddGuideStreamConfig(OperationConfig):
+    """Configuration for adding a guide video stream to a dataset.
+
+    The guide stream repeats the first frame of ``source_key`` throughout every
+    episode.  It is encoded as a regular video stream under ``new_key`` so that
+    any policy or visualisation tool can use it as a reference image.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
 
 
 @OperationConfig.register_subclass("info")
@@ -577,6 +613,49 @@ def _get_dataset_size(repo_path):
     return total
 
 
+def handle_add_guide_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddGuideStreamConfig):
+        raise ValueError("Operation config must be AddGuideStreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError("operation.source_key must be specified for add_guide_stream operation")
+
+    if not cfg.operation.new_key:
+        raise ValueError("operation.new_key must be specified for add_guide_stream operation")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Adding guide stream '{cfg.operation.new_key}' "
+        f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+    )
+    new_dataset = add_guide_stream(
+        dataset=dataset,
+        source_key=cfg.operation.source_key,
+        new_key=cfg.operation.new_key,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+        g=cfg.operation.g,
+        crf=cfg.operation.crf,
+    )
+
+    logging.info(f"Dataset with guide stream saved to {output_dir}")
+    logging.info(f"Video keys: {new_dataset.meta.video_keys}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
 def handle_info(cfg: EditDatasetConfig):
     if not isinstance(cfg.operation, InfoConfig):
         raise ValueError("Operation config must be InfoConfig")
@@ -625,6 +704,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "add_guide_stream":
+        handle_add_guide_stream(cfg)
     elif operation_type == "info":
         handle_info(cfg)
     else:

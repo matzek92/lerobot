@@ -53,7 +53,13 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import decode_video_frames, encode_video_frames, get_video_info
+from lerobot.datasets.video_utils import (
+    _get_codec_options,
+    decode_video_frames,
+    encode_video_frames,
+    get_video_info,
+    resolve_vcodec,
+)
 from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
 
 
@@ -1989,4 +1995,339 @@ def convert_image_to_video_dataset(
     logging.info(f"New dataset saved to: {output_dir}")
 
     # Return new dataset
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+def _encode_guide_video(
+    src_dataset: LeRobotDataset,
+    source_key: str,
+    episodes: list[int],
+    output_path: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> list[tuple[float, float]]:
+    """Create a guide video by repeating the first frame of each episode.
+
+    For each episode, decodes the first frame from ``source_key`` in the source
+    dataset and encodes it ``episode_length`` times into ``output_path``.
+    Multiple episodes are concatenated into the same video file, matching the
+    chunked storage layout used by other video streams.
+
+    Args:
+        src_dataset: Source dataset to read frames from.
+        source_key: Video key to use as the source for the guide frames.
+        episodes: Ordered list of episode indices to include in this video file.
+        output_path: Destination video file path.
+        fps: Frames per second for the output video.
+        vcodec: Video codec (default: libsvtav1).
+        pix_fmt: Pixel format (default: yuv420p).
+        g: GOP size (default: 2).
+        crf: Constant rate factor for quality (default: 30).
+
+    Returns:
+        List of ``(from_timestamp, to_timestamp)`` tuples (one per episode).
+    """
+    from fractions import Fraction
+
+    import av
+
+    vcodec = resolve_vcodec(vcodec)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    codec_options = _get_codec_options(vcodec, g, crf)
+
+    episode_timestamps: list[tuple[float, float]] = []
+    cumulative_ts = 0.0
+    frame_count = 0
+
+    with av.open(str(output_path), mode="w") as out_container:
+        out_stream = None
+
+        for ep_idx in episodes:
+            ep = src_dataset.meta.episodes[ep_idx]
+            ep_length = ep["length"]
+            src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
+
+            # Locate and open source video file for this episode
+            src_video_rel_path = src_dataset.meta.get_video_file_path(ep_idx, source_key)
+            src_video_path = src_dataset.root / src_video_rel_path
+
+            # Decode the first frame of this episode
+            first_frame_image = None
+            with av.open(str(src_video_path)) as in_container:
+                in_stream = in_container.streams.video[0]
+                # Seek to episode start (in microseconds, the global AV time base)
+                seek_us = int(src_from_ts * 1_000_000)
+                in_container.seek(seek_us, backward=True, stream=in_stream)
+
+                for packet in in_container.demux(in_stream):
+                    for frame in packet.decode():
+                        if frame is not None:
+                            first_frame_image = frame.to_image().convert("RGB")
+                            break
+                    if first_frame_image is not None:
+                        break
+
+            if first_frame_image is None:
+                raise ValueError(
+                    f"Could not decode first frame for episode {ep_idx}, "
+                    f"source key '{source_key}'"
+                )
+
+            # Initialize output stream from first decoded frame
+            if out_stream is None:
+                out_stream = out_container.add_stream(vcodec, rate=fps_fraction, options=codec_options)
+                out_stream.width = first_frame_image.width
+                out_stream.height = first_frame_image.height
+                out_stream.pix_fmt = pix_fmt
+
+            # Convert PIL image to av.VideoFrame in the target pixel format.
+            # Convert *once* to a numpy array (outside the repetition loop) so that
+            # av.VideoFrame.from_ndarray() — which is cheap — can create distinct
+            # frame objects per repetition.  av.VideoFrame has no copy() method, and
+            # reusing the same object with mutated PTS is unsafe with some encoders.
+            guide_av_frame = av.VideoFrame.from_image(first_frame_image)
+            guide_av_frame = guide_av_frame.reformat(
+                width=out_stream.width,
+                height=out_stream.height,
+                format=pix_fmt,
+            )
+            guide_array = guide_av_frame.to_ndarray(format=pix_fmt)
+
+            # Encode the guide frame ep_length times (once per episode frame)
+            for _ in range(ep_length):
+                frame_to_encode = av.VideoFrame.from_ndarray(guide_array, format=pix_fmt)
+                frame_to_encode.pts = frame_count
+                for pkt in out_stream.encode(frame_to_encode):
+                    out_container.mux(pkt)
+                frame_count += 1
+
+            from_ts = cumulative_ts
+            to_ts = cumulative_ts + ep_length / fps
+            episode_timestamps.append((from_ts, to_ts))
+            cumulative_ts = to_ts
+
+        # Flush encoder
+        if out_stream is not None:
+            for pkt in out_stream.encode(None):
+                out_container.mux(pkt)
+
+    return episode_timestamps
+
+
+def _update_episodes_metadata_with_video(
+    new_meta: LeRobotDatasetMetadata,
+    video_metadata: dict[int, dict],
+) -> None:
+    """Append new video-key columns to existing episodes metadata parquet files.
+
+    After copying episodes metadata from the source dataset, call this function
+    to add the chunk/file/timestamp columns for a newly created video stream.
+
+    Args:
+        new_meta: Metadata of the destination dataset (used to locate parquet files).
+        video_metadata: Mapping from episode index to a dict of column_name → value.
+            All episode entries must have the same set of keys.
+    """
+    if not video_metadata:
+        return
+
+    video_cols = list(next(iter(video_metadata.values())).keys())
+    episodes_dir = new_meta.root / "meta" / "episodes"
+
+    for parquet_path in sorted(episodes_dir.rglob("*.parquet")):
+        df = pd.read_parquet(parquet_path)
+
+        # Build one mapping dict per column and use pandas .map() for efficiency.
+        for col in video_cols:
+            col_map = {ep_idx: ep_data[col] for ep_idx, ep_data in video_metadata.items()}
+            df[col] = df["episode_index"].map(col_map)
+
+        df.to_parquet(parquet_path, index=False)
+
+
+def add_guide_stream(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> LeRobotDataset:
+    """Add a guide video stream to a LeRobotDataset.
+
+    The guide stream repeats the *first frame* of a source camera throughout
+    each episode.  It serves as a static reference image that shows where a
+    relevant object is at the start of the episode — useful for downstream
+    policies or visualisation.
+
+    The new video files follow the same chunk/file layout as ``source_key``:
+    episodes that share a source video file are grouped into the same guide
+    video file.
+
+    Args:
+        dataset: The source LeRobotDataset (must contain at least one video key).
+        source_key: Existing video key whose first episode frame is used as the
+            guide (e.g. ``"observation.images.laptop"``).
+        new_key: Name for the new guide video stream
+            (e.g. ``"observation.images.guide_laptop"``).
+        output_dir: Directory for the new dataset.  If ``None``, defaults to
+            ``HF_LEROBOT_HOME / repo_id``.
+        repo_id: Repository ID for the new dataset.  If ``None``, ``"_with_guide"``
+            is appended to the original repo ID.
+        vcodec: Video codec for the guide stream (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format for the guide stream (default: ``"yuv420p"``).
+        g: GOP size for encoding (default: ``2``).
+        crf: Constant rate factor / quality setting (default: ``30``).
+
+    Returns:
+        New :class:`LeRobotDataset` with the guide stream added.
+
+    Example::
+
+        dataset = LeRobotDataset("my_user/my_dataset")
+        new_dataset = add_guide_stream(
+            dataset,
+            source_key="observation.images.laptop",
+            new_key="observation.images.guide_laptop",
+        )
+    """
+    if source_key not in dataset.meta.video_keys:
+        raise ValueError(
+            f"source_key '{source_key}' must be a video stream. "
+            f"Video keys in dataset: {dataset.meta.video_keys}. "
+            "If source_key is stored as images, first convert to video using "
+            "convert_image_to_video_dataset()."
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_with_guide"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # Build new features dict: copy source feature spec (shape/dtype) for the guide
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    # Create destination metadata
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy parquet data files (no column changes needed for a video-only addition)
+    logging.info("Copying data files…")
+    data_dir_src = dataset.root / DATA_DIR
+    data_dir_dst = new_meta.root / DATA_DIR
+    shutil.copytree(data_dir_src, data_dir_dst)
+
+    # Copy existing video files
+    logging.info("Copying existing video files…")
+    _copy_videos(dataset, new_meta)
+
+    # Copy episodes metadata (will be extended with guide-stream columns below)
+    logging.info("Copying episodes metadata…")
+    episodes_src = dataset.root / "meta" / "episodes"
+    episodes_dst = new_meta.root / "meta" / "episodes"
+    if episodes_src.exists():
+        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
+
+    # Copy tasks and stats
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+    if dataset.meta.stats is not None:
+        write_stats(dataset.meta.stats, new_meta.root)
+
+    # Group episodes by their source video file (same chunk/file layout)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    for ep_idx in range(dataset.meta.total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
+        file_idx = ep[f"videos/{source_key}/file_index"]
+        file_key = (chunk_idx, file_idx)
+        file_to_episodes.setdefault(file_key, []).append(ep_idx)
+
+    # Encode guide stream videos and collect per-episode metadata
+    fps = dataset.meta.fps
+    guide_video_metadata: dict[int, dict] = {}
+
+    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
+        sorted(file_to_episodes.items()), desc="Encoding guide stream videos"
+    ):
+        assert new_meta.video_path is not None
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+        )
+
+        episode_timestamps = _encode_guide_video(
+            src_dataset=dataset,
+            source_key=source_key,
+            episodes=eps_in_file,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
+            guide_video_metadata[ep_idx] = {
+                f"videos/{new_key}/chunk_index": src_chunk_idx,
+                f"videos/{new_key}/file_index": src_file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Extend episodes metadata parquet files with the new video columns
+    logging.info("Updating episodes metadata with guide stream info…")
+    _update_episodes_metadata_with_video(new_meta, guide_video_metadata)
+
+    # Populate video codec/resolution info for the new key
+    first_guide_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_guide_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_guide_path)
+
+    # Propagate existing video feature info (codec metadata) from source dataset
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    # Update dataset-level counters
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+        }
+    )
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"Guide stream '{new_key}' added. Dataset saved to: {output_dir}")
     return LeRobotDataset(repo_id=repo_id, root=output_dir)
