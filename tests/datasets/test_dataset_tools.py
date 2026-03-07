@@ -29,6 +29,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    trim_episodes,
 )
 from lerobot.scripts.lerobot_edit_dataset import convert_image_to_video_dataset
 
@@ -139,6 +140,183 @@ def test_delete_empty_list(sample_dataset, tmp_path):
             sample_dataset,
             episode_indices=[],
             output_dir=tmp_path / "filtered",
+        )
+
+
+def test_trim_single_episode_start(sample_dataset, tmp_path):
+    """Test trimming frames from the start of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(output_dir)
+
+        new_dataset = trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (3, 0)},
+            output_dir=output_dir,
+        )
+
+    # 5 episodes, episode 0 trimmed by 3 from start → 7 + 4*10 = 47 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 47
+    assert len(new_dataset) == 47
+
+    # Episode 0 should now have 7 frames
+    ep0_frames = [
+        i for i in range(len(new_dataset)) if int(new_dataset.hf_dataset["episode_index"][i].item()) == 0
+    ]
+    assert len(ep0_frames) == 7
+
+    # frame_index for episode 0 should start at 0
+    frame_indices_ep0 = [
+        int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep0_frames
+    ]
+    assert frame_indices_ep0 == list(range(7))
+
+    # timestamp for episode 0 should start at 0.0
+    timestamps_ep0 = [
+        float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep0_frames
+    ]
+    assert timestamps_ep0[0] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_trim_single_episode_end(sample_dataset, tmp_path):
+    """Test trimming frames from the end of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(output_dir)
+
+        new_dataset = trim_episodes(
+            sample_dataset,
+            episode_trim_specs={2: (0, 4)},
+            output_dir=output_dir,
+        )
+
+    # 5 episodes, episode 2 trimmed by 4 from end → 6 + 4*10 = 46 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 46
+
+
+def test_trim_single_episode_both_ends(sample_dataset, tmp_path):
+    """Test trimming frames from both ends of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(output_dir)
+
+        new_dataset = trim_episodes(
+            sample_dataset,
+            episode_trim_specs={1: (2, 3)},
+            output_dir=output_dir,
+        )
+
+    # 5 episodes, episode 1 trimmed by 5 total → 5 + 4*10 = 45 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 45
+
+    # Episode 1 should have 5 frames
+    ep1_frames = [
+        i for i in range(len(new_dataset)) if int(new_dataset.hf_dataset["episode_index"][i].item()) == 1
+    ]
+    assert len(ep1_frames) == 5
+
+
+def test_trim_multiple_episodes(sample_dataset, tmp_path):
+    """Test trimming multiple episodes at once."""
+    output_dir = tmp_path / "trimmed"
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(output_dir)
+
+        new_dataset = trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (2, 1), 3: (1, 2)},
+            output_dir=output_dir,
+        )
+
+    # ep0: 10-3=7, ep3: 10-3=7, others: 10 each
+    # Total: 7 + 10 + 10 + 7 + 10 = 44
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 44
+
+
+def test_trim_all_episodes_same_spec(sample_dataset, tmp_path):
+    """Test trimming all episodes by the same amount."""
+    output_dir = tmp_path / "trimmed"
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(output_dir)
+
+        specs = {i: (1, 1) for i in range(5)}
+        new_dataset = trim_episodes(
+            sample_dataset,
+            episode_trim_specs=specs,
+            output_dir=output_dir,
+        )
+
+    # Each episode: 10 - 2 = 8 frames → 5 * 8 = 40
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 40
+
+
+def test_trim_invalid_episode_index(sample_dataset, tmp_path):
+    """Test that invalid episode index raises error."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={99: (1, 0)},
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_too_many_frames(sample_dataset, tmp_path):
+    """Test that trimming too many frames raises an error."""
+    with pytest.raises(ValueError, match="Cannot trim"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (5, 5)},  # 5+5=10 >= episode length of 10
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_empty_specs(sample_dataset, tmp_path):
+    """Test that empty trim specs raises error."""
+    with pytest.raises(ValueError, match="No trim specifications provided"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={},
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_negative_values(sample_dataset, tmp_path):
+    """Test that negative trim values raise an error."""
+    with pytest.raises(ValueError, match="non-negative"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (-1, 0)},
+            output_dir=tmp_path / "trimmed",
         )
 
 
