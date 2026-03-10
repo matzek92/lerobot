@@ -19,12 +19,15 @@ Simple ZMQ image server client for verifying that the ImageServer video stream
 is working correctly.
 
 Connects to a running :class:`ImageServer` over ZMQ, receives JPEG frames and
-displays them in an OpenCV window using ``cv2.imshow``.  Press **q** or
-**Escape** to quit.
+displays them in an OpenCV window using ``cv2.imshow``.
+
+The window shows two images side by side:
+  - **Live** – real-time camera feed (left)
+  - **Guide** – frozen snapshot from episode start (right, border highlighted)
 
 Keyboard controls:
   - **q** / **Escape** – quit
-  - **r** – send ``recording_start`` event
+  - **r** – send ``recording_start`` event (captures new guide snapshot)
   - **s** – send ``recording_stop`` event
   - **e** – send ``episode_end`` event
 
@@ -137,17 +140,41 @@ def run_client(
                 meta = json.loads(parts[0].decode("utf-8"))
                 cameras = meta.get("cameras", [])
 
-                if camera_name is not None and camera_name in cameras:
-                    idx = cameras.index(camera_name)
-                elif cameras:
-                    idx = 0
-                else:
-                    logger.warning("No cameras listed in server metadata, skipping frame.")
+                # Decode all camera images into a dict
+                decoded: dict[str, np.ndarray] = {}
+                for i, cam_name in enumerate(cameras):
+                    jpeg_bytes = parts[i + 1]
+                    img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        decoded[cam_name] = img
+
+                if not decoded:
+                    logger.warning("Failed to decode any image, skipping frame.")
                     continue
 
-                jpeg_bytes = parts[idx + 1]
-                frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
-                active_camera = cameras[idx] if cameras else "unknown"
+                # Find matching live + guide pair
+                # Prefer --camera-name, otherwise first live camera.
+                live_cam = None
+                if camera_name and camera_name in decoded:
+                    live_cam = camera_name
+                else:
+                    for c in cameras:
+                        if not c.endswith("_guide"):
+                            live_cam = c
+                            break
+
+                if live_cam is None:
+                    live_cam = cameras[0]
+
+                guide_cam = live_cam + "_guide"
+
+                live_frame = decoded.get(live_cam)
+                guide_frame = decoded.get(guide_cam)
+
+                if live_frame is None:
+                    logger.warning(f"No live frame for '{live_cam}', skipping.")
+                    continue
+
             else:
                 # Legacy protocol v1: single-part JSON / base64
                 import base64
@@ -161,16 +188,17 @@ def run_client(
 
                 if camera_name is not None and camera_name in images:
                     img_b64 = images[camera_name]
-                    active_camera = camera_name
+                    live_cam = camera_name
                 else:
-                    active_camera, img_b64 = next(iter(images.items()))
+                    live_cam, img_b64 = next(iter(images.items()))
 
                 img_bytes = base64.b64decode(img_b64)
-                frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                live_frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                guide_frame = None
 
-            if frame is None:
-                logger.warning("Failed to decode image, skipping frame.")
-                continue
+                if live_frame is None:
+                    logger.warning("Failed to decode legacy image, skipping frame.")
+                    continue
 
             # FPS overlay ---------------------------------------------------
             frame_count += 1
@@ -179,41 +207,61 @@ def run_client(
                 fps = frame_count / elapsed
                 frame_count = 0
                 fps_start = time.time()
-                logger.debug(f"Camera '{active_camera}' – FPS: {fps:.1f}")
+                logger.debug(f"Camera '{live_cam}' – FPS: {fps:.1f}")
             else:
                 fps = frame_count / max(elapsed, 1e-6)
 
-            # Status overlay
-            status_text = f"{active_camera}  {fps:.1f} FPS"
+            # Annotate live frame
+            status_text = f"{live_cam}  {fps:.1f} FPS"
             if recording:
                 status_text += "  [REC]"
             status_color = (0, 0, 255) if recording else (0, 255, 0)
 
             cv2.putText(
-                frame,
-                status_text,
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                status_color,
-                2,
-                cv2.LINE_AA,
+                live_frame, "LIVE", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2, cv2.LINE_AA,
             )
+            cv2.putText(
+                live_frame, status_text, (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 1, cv2.LINE_AA,
+            )
+
+            # Build composite: live (left) | guide (right)
+            if guide_frame is not None:
+                # Resize guide to match live height if needed
+                h, w = live_frame.shape[:2]
+                gh, gw = guide_frame.shape[:2]
+                if gh != h:
+                    scale = h / gh
+                    guide_frame = cv2.resize(guide_frame, (int(gw * scale), h))
+
+                # Add "GUIDE" label and green border
+                cv2.putText(
+                    guide_frame, "GUIDE", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA,
+                )
+                cv2.rectangle(
+                    guide_frame, (0, 0),
+                    (guide_frame.shape[1] - 1, guide_frame.shape[0] - 1),
+                    (0, 200, 255), 3,
+                )
+
+                # Separator line (2px white)
+                sep = np.full((h, 2, 3), 255, dtype=np.uint8)
+                canvas = np.hstack([live_frame, sep, guide_frame])
+            else:
+                canvas = live_frame
 
             # Key hints when event port is configured
             if event_socket is not None:
                 cv2.putText(
-                    frame,
+                    canvas,
                     "[r] rec start  [s] rec stop  [e] episode end",
-                    (10, frame.shape[0] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (200, 200, 200),
-                    1,
-                    cv2.LINE_AA,
+                    (10, canvas.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA,
                 )
 
-            cv2.imshow(window_title, frame)
+            cv2.imshow(window_title, canvas)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):  # 'q' or Escape
