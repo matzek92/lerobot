@@ -128,7 +128,7 @@ def highlight_object_fadeout(
     # distanceTransform measures distance of 0-pixels — that's the fg, not
     # what we want.  Instead: pass mask itself as src; then distance is
     # computed for the 0-valued (background) pixels.
-    dist = cv2.distanceTransform(1 - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    dist = cv2.distanceTransform(1 - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_5)
     # dist[fg] == 0, dist[bg] == euclidean distance to nearest fg pixel
 
     # Build per-pixel brightness multiplier
