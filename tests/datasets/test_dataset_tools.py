@@ -23,6 +23,7 @@ import torch
 
 from lerobot.datasets.dataset_tools import (
     add_features,
+    add_guide_stream,
     delete_episodes,
     merge_datasets,
     modify_features,
@@ -1614,3 +1615,105 @@ def test_convert_image_to_video_dataset_subset_episodes(tmp_path):
 
         if output_dir.exists():
             shutil.rmtree(output_dir)
+
+
+
+@pytest.fixture
+def video_dataset_for_guide(tmp_path, empty_lerobot_dataset_factory):
+    """Create a local video dataset for guide stream tests (no internet required)."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (64, 64, 3), "names": None},
+    }
+    img_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "img_ds",
+        features=features,
+    )
+    for ep_idx in range(3):
+        for _ in range(4):
+            img_dataset.add_frame(
+                {
+                    "action": np.random.randn(6).astype(np.float32),
+                    "observation.images.top": np.random.randint(
+                        0, 255, size=(64, 64, 3), dtype=np.uint8
+                    ),
+                    "task": "task_0",
+                }
+            )
+        img_dataset.save_episode()
+    img_dataset.finalize()
+
+    # Reload from disk so that meta.episodes is populated (finalize() writes to disk
+    # but does not refresh the in-memory meta.episodes).
+    img_dataset = LeRobotDataset(repo_id=img_dataset.repo_id, root=img_dataset.root)
+
+    video_dir = tmp_path / "vid_ds"
+    return convert_image_to_video_dataset(
+        dataset=img_dataset,
+        output_dir=video_dir,
+        repo_id="test/video_dataset",
+        num_workers=1,
+    )
+
+
+def test_add_guide_stream(video_dataset_for_guide, tmp_path):
+    """Test adding a guide stream to a video dataset."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_guide"
+    guide_dir = tmp_path / "guide_ds"
+
+    guide_dataset = add_guide_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=guide_dir,
+        repo_id="test/guide_dataset",
+    )
+
+    # New dataset must contain the guide stream as an additional video key
+    assert new_key in guide_dataset.meta.video_keys
+    assert len(guide_dataset.meta.video_keys) == len(video_dataset.meta.video_keys) + 1
+
+    # Episode and frame counts must be preserved
+    assert guide_dataset.meta.total_episodes == video_dataset.meta.total_episodes
+    assert guide_dataset.meta.total_frames == video_dataset.meta.total_frames
+
+    # A guide video file must exist for every episode
+    for ep_idx in range(guide_dataset.meta.total_episodes):
+        guide_path = guide_dataset.root / guide_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert guide_path.exists(), f"Guide video file should exist: {guide_path}"
+
+    # Feature shape must match the source camera
+    assert guide_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+    # All original video keys are still present
+    for key in video_dataset.meta.video_keys:
+        assert key in guide_dataset.meta.video_keys
+
+
+def test_add_guide_stream_invalid_source_key(video_dataset_for_guide, tmp_path):
+    """Test that add_guide_stream raises ValueError for a non-existent/non-video source key."""
+    with pytest.raises(ValueError, match="source_key"):
+        add_guide_stream(
+            dataset=video_dataset_for_guide,
+            source_key="nonexistent_key",
+            new_key="observation.images.guide",
+            output_dir=tmp_path / "out_err",
+            repo_id="test/guide_err",
+        )
+
+
+def test_add_guide_stream_duplicate_key(video_dataset_for_guide, tmp_path):
+    """Test that add_guide_stream raises ValueError when new_key already exists."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="already exists"):
+        add_guide_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=source_key,  # duplicate
+            output_dir=tmp_path / "out_dup",
+            repo_id="test/guide_dup",
+        )
