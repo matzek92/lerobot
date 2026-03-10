@@ -17,9 +17,9 @@
 """
 Edit LeRobot datasets using various transformation tools.
 
-This script allows you to delete episodes, split datasets, merge datasets,
-remove features, modify tasks, and convert image datasets to video format.
-When new_repo_id is specified, creates a new dataset.
+This script allows you to delete episodes, trim episodes, split datasets,
+merge datasets, remove features, modify tasks, and convert image datasets to
+video format. When new_repo_id is specified, creates a new dataset.
 
 Usage Examples:
 
@@ -35,6 +35,32 @@ Delete episodes and save to a new dataset:
         --new_repo_id lerobot/pusht_filtered \
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
+
+Trim 5 frames from the start and 3 frames from the end of episode 0, and
+2 frames from the start of episode 2:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_trimmed \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [5, 3], "2": [2, 0]}'
+
+Trim episodes and use the visualization tool to find cut boundaries first:
+    # Step 1: Visualize episode 0 to find the frame indices to trim
+    lerobot-dataset-viz --repo-id lerobot/pusht --episode-index 0
+
+    # Step 2: Trim based on the identified frame indices
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_trimmed \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [10, 5]}'
+
+Append trimmed episodes from a source dataset to an existing target dataset (incremental workflow):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [5, 3]}' \
+        --operation.append_to_repo_id lerobot/pusht_existing
 
 Split dataset by fractions:
     lerobot-edit-dataset \
@@ -138,6 +164,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    trim_episodes,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -149,6 +176,18 @@ class OperationConfig(draccus.ChoiceRegistry, abc.ABC):
     @property
     def type(self) -> str:
         return self.get_choice_name(self.__class__)
+
+
+@OperationConfig.register_subclass("trim_episodes")
+@dataclass
+class TrimEpisodesConfig(OperationConfig):
+    # Keys are episode indices as strings because JSON/CLI argument parsing
+    # always produces string dict keys.  They are converted to int in
+    # handle_trim_episodes before being passed to trim_episodes().
+    episode_trim_specs: dict[str, tuple[int, int]] | None = None
+    # When set, trimmed episodes are appended to this existing repo instead of
+    # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
+    append_to_repo_id: str | None = None
 
 
 @OperationConfig.register_subclass("delete_episodes")
@@ -261,6 +300,75 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimEpisodesConfig):
+        raise ValueError("Operation config must be TrimEpisodesConfig")
+
+    if not cfg.operation.episode_trim_specs:
+        raise ValueError(
+            "episode_trim_specs must be specified for trim_episodes operation. "
+            "Provide a dict mapping episode indices to (trim_start, trim_end) tuples, e.g. "
+            '\'{"0": [5, 3], "2": [2, 0]}\''
+        )
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    # Convert string keys to int (CLI args come in as strings)
+    episode_trim_specs: dict[int, tuple[int, int]] = {}
+    for k, v in cfg.operation.episode_trim_specs.items():
+        episode_trim_specs[int(k)] = (int(v[0]), int(v[1]))
+
+    if cfg.operation.append_to_repo_id is not None:
+        # Append mode: load the target dataset and append trimmed episodes to it.
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending trimmed episodes from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            append_to_dataset=append_to_dataset,
+        )
+
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        # Normal mode: write trimmed output to a new (or in-place replaced) dataset.
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(f"Trimming episodes {list(episode_trim_specs.keys())} in {cfg.repo_id}")
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+        )
+
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
 
 
 def handle_split(cfg: EditDatasetConfig) -> None:
@@ -505,6 +613,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "trim_episodes":
+        handle_trim_episodes(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":
