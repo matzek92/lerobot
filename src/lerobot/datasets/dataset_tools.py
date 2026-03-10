@@ -2688,3 +2688,563 @@ def add_initial_scene_segmentation_stream(
 
     logging.info(f"Segmented stream '{new_key}' added. Dataset saved to: {output_dir}")
     return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Helper: decode ALL frames of an episode from a video stream as BGR
+# ---------------------------------------------------------------------------
+
+def _decode_all_frames_bgr(
+    dataset: LeRobotDataset,
+    episode_idx: int,
+    source_key: str,
+) -> list[np.ndarray]:
+    """Decode every frame of an episode's video stream and return as BGR numpy arrays.
+
+    Args:
+        dataset: Source dataset.
+        episode_idx: Episode index.
+        source_key: Video key to read from.
+
+    Returns:
+        List of BGR images (H, W, 3), dtype uint8, one per frame.
+    """
+    import av
+    import cv2
+
+    ep = dataset.meta.episodes[episode_idx]
+    src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
+    src_to_ts = ep[f"videos/{source_key}/to_timestamp"]
+    ep_length = ep["length"]
+    src_video_rel_path = dataset.meta.get_video_file_path(episode_idx, source_key)
+    src_video_path = dataset.root / src_video_rel_path
+
+    frames: list[np.ndarray] = []
+    with av.open(str(src_video_path)) as container:
+        stream = container.streams.video[0]
+        seek_us = int(src_from_ts * 1_000_000)
+        container.seek(seek_us, backward=True, stream=stream)
+
+        end_us = int(src_to_ts * 1_000_000)
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                if frame is None:
+                    continue
+                frame_us = int(frame.time * 1_000_000) if frame.time is not None else 0
+                if frame_us < seek_us:
+                    continue
+                if frame_us > end_us and len(frames) >= ep_length:
+                    break
+                rgb = np.array(frame.to_image().convert("RGB"))
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                frames.append(bgr)
+                if len(frames) >= ep_length:
+                    break
+            if len(frames) >= ep_length:
+                break
+
+    return frames[:ep_length]
+
+
+# ---------------------------------------------------------------------------
+# Helper: encode a list of per-frame BGR images as a video
+# ---------------------------------------------------------------------------
+
+def _encode_frame_list_video(
+    frames_per_episode: dict[int, list[np.ndarray]],
+    episode_lengths: dict[int, int],
+    episodes: list[int],
+    output_path: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> list[tuple[float, float]]:
+    """Encode per-frame BGR images for multiple episodes into one video file.
+
+    Unlike ``_encode_precomputed_guide_video`` (which repeats a single frame),
+    this function encodes a different image per frame.
+
+    Args:
+        frames_per_episode: Mapping of episode index → list of BGR images.
+        episode_lengths: Mapping of episode index → expected number of frames.
+        episodes: Ordered list of episode indices to encode.
+        output_path: Destination video file path.
+        fps: Frames per second.
+        vcodec, pix_fmt, g, crf: Encoding parameters.
+
+    Returns:
+        List of ``(from_timestamp, to_timestamp)`` tuples, one per episode.
+    """
+    from fractions import Fraction
+
+    import av
+    import cv2
+
+    vcodec = resolve_vcodec(vcodec)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    codec_options = _get_codec_options(vcodec, g, crf)
+
+    episode_timestamps: list[tuple[float, float]] = []
+    cumulative_ts = 0.0
+    frame_count = 0
+
+    with av.open(str(output_path), mode="w") as out_container:
+        out_stream = None
+
+        for ep_idx in episodes:
+            bgr_frames = frames_per_episode[ep_idx]
+            ep_length = episode_lengths[ep_idx]
+
+            for i in range(min(len(bgr_frames), ep_length)):
+                rgb = cv2.cvtColor(bgr_frames[i], cv2.COLOR_BGR2RGB)
+                from PIL import Image
+                pil_image = Image.fromarray(rgb)
+
+                if out_stream is None:
+                    out_stream = out_container.add_stream(
+                        vcodec, rate=fps_fraction, options=codec_options
+                    )
+                    out_stream.width = pil_image.width
+                    out_stream.height = pil_image.height
+                    out_stream.pix_fmt = pix_fmt
+
+                av_frame = av.VideoFrame.from_image(pil_image)
+                av_frame = av_frame.reformat(
+                    width=out_stream.width, height=out_stream.height, format=pix_fmt
+                )
+                frame_to_encode = av.VideoFrame.from_ndarray(
+                    av_frame.to_ndarray(format=pix_fmt), format=pix_fmt
+                )
+                frame_to_encode.pts = frame_count
+                for pkt in out_stream.encode(frame_to_encode):
+                    out_container.mux(pkt)
+                frame_count += 1
+
+            from_ts = cumulative_ts
+            to_ts = cumulative_ts + ep_length / fps
+            episode_timestamps.append((from_ts, to_ts))
+            cumulative_ts = to_ts
+
+        if out_stream is not None:
+            for pkt in out_stream.encode(None):
+                out_container.mux(pkt)
+
+    return episode_timestamps
+
+
+# ---------------------------------------------------------------------------
+# Public API: add_sam2_stream
+# ---------------------------------------------------------------------------
+
+def add_sam2_stream(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+    fade_pixels: int = 16,
+    min_brightness: float = 0.0,
+) -> LeRobotDataset:
+    """Add a SAM2 video-tracked segmentation stream to the dataset.
+
+    For every episode:
+
+    1. The first frame of ``source_key`` is shown in an interactive OpenCV
+       window where the user selects an object using SAM2 point prompts.
+    2. The SAM2 **video predictor** propagates the mask across all frames
+       of the episode.
+    3. Each frame is highlighted (foreground preserved, background faded).
+    4. The resulting stream is previewed in **Rerun** so the user can
+       inspect the tracking quality.
+    5. The user confirms (``y``) or rejects (``n``) the result.
+       If rejected, the raw source frames are used for that episode.
+    6. The confirmed frames are encoded as a new video stream.
+
+    Args:
+        dataset: Source LeRobotDataset (must contain at least one video key).
+        source_key: Existing video key to segment
+            (e.g. ``"observation.images.top_back"``).
+        new_key: Name for the new segmented stream
+            (e.g. ``"observation.images.sam2_top_back"``).
+        output_dir: Directory for the new dataset.
+        repo_id: Repository ID for the new dataset.
+        vcodec: Video codec (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format (default: ``"yuv420p"``).
+        g: GOP size (default: ``2``).
+        crf: Constant rate factor (default: ``30``).
+        fade_pixels: Number of pixels for the fade-to-black gradient.
+        min_brightness: Background brightness (0.0 = black).
+
+    Returns:
+        New :class:`LeRobotDataset` with the SAM2-tracked stream added.
+    """
+    import gc
+    import time
+
+    import rerun as rr
+
+    from lerobot.cameras.zmq.segment import (
+        SAM2Segmenter,
+        SAM2VideoSegmenter,
+        highlight_object_fadeout,
+        interactive_select,
+    )
+
+    if source_key not in dataset.meta.video_keys:
+        raise ValueError(
+            f"source_key '{source_key}' must be a video stream. "
+            f"Video keys in dataset: {dataset.meta.video_keys}."
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_sam2"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # -- Load models --------------------------------------------------------
+    logging.info("Loading SAM2 image segmenter (for interactive selection) …")
+    image_segmenter = SAM2Segmenter()
+    logging.info("Loading SAM2 video segmenter (for temporal propagation) …")
+    video_segmenter = SAM2VideoSegmenter()
+
+    total_episodes = dataset.meta.total_episodes
+    fps = dataset.meta.fps
+    processed_frames: dict[int, list[np.ndarray]] = {}
+    episode_lengths: dict[int, int] = {}
+
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        ep_length = ep["length"]
+        episode_lengths[ep_idx] = ep_length
+
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Decoding {ep_length} frames from '{source_key}' …"
+        )
+        frames_bgr = _decode_all_frames_bgr(dataset, ep_idx, source_key)
+
+        if not frames_bgr:
+            logging.warning(f"Episode {ep_idx}: no frames decoded, skipping.")
+            processed_frames[ep_idx] = []
+            continue
+
+        # -- Step 1: interactive selection on first frame -------------------
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            "Select object to track (Enter=confirm, Esc=skip)"
+        )
+        _highlighted, mask = interactive_select(
+            frames_bgr[0],
+            image_segmenter,
+            window_name=f"SAM2 Track – Episode {ep_idx} ({source_key})",
+            fade_pixels=fade_pixels,
+            min_brightness=min_brightness,
+        )
+
+        if mask is None:
+            logging.info(f"Episode {ep_idx}: selection cancelled, using raw frames.")
+            processed_frames[ep_idx] = frames_bgr
+            continue
+
+        # Recover the points/labels from the interactive session
+        # We re-do image segmentation to extract the points that were used.
+        # However, interactive_select doesn't return points. So instead,
+        # we use the mask directly with the video predictor via add_new_mask.
+        # Let's propagate using the mask from frame 0.
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Propagating mask across {ep_length} frames with SAM2 video predictor …"
+        )
+        masks = _propagate_mask_across_frames(video_segmenter, frames_bgr, mask)
+        del mask  # free initial mask
+
+        # Apply highlighting to each frame (in-place to save memory)
+        highlighted_frames: list[np.ndarray] = []
+        for i in range(len(frames_bgr)):
+            highlighted = highlight_object_fadeout(
+                frames_bgr[i], masks[i],
+                fade_pixels=fade_pixels, min_brightness=min_brightness,
+            )
+            highlighted_frames.append(highlighted)
+            # Free source frame and mask immediately after use
+            frames_bgr[i] = None  # type: ignore[assignment]
+            masks[i] = None  # type: ignore[assignment]
+
+        # Re-decode source frames (lightweight) only for the Rerun preview
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            "Starting Rerun preview …"
+        )
+        preview_source = _decode_all_frames_bgr(dataset, ep_idx, source_key)
+        accepted = _preview_and_confirm_rerun(
+            episode_idx=ep_idx,
+            source_frames=preview_source,
+            segmented_frames=highlighted_frames,
+            masks=[],  # masks already freed
+            fps=fps,
+            source_key=source_key,
+            new_key=new_key,
+        )
+        del preview_source
+
+        if accepted:
+            logging.info(f"Episode {ep_idx}: confirmed ✓")
+            processed_frames[ep_idx] = highlighted_frames
+        else:
+            logging.info(f"Episode {ep_idx}: rejected, using raw frames.")
+            del highlighted_frames
+            processed_frames[ep_idx] = _decode_all_frames_bgr(
+                dataset, ep_idx, source_key
+            )
+
+    # -- Build new dataset structure ----------------------------------------
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy parquet data files
+    logging.info("Copying data files …")
+    data_dir_src = dataset.root / DATA_DIR
+    data_dir_dst = new_meta.root / DATA_DIR
+    shutil.copytree(data_dir_src, data_dir_dst)
+
+    # Copy existing video files
+    logging.info("Copying existing video files …")
+    _copy_videos(dataset, new_meta)
+
+    # Copy episodes metadata
+    logging.info("Copying episodes metadata …")
+    episodes_src = dataset.root / "meta" / "episodes"
+    episodes_dst = new_meta.root / "meta" / "episodes"
+    if episodes_src.exists():
+        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
+
+    # Copy tasks and stats
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+    if dataset.meta.stats is not None:
+        write_stats(dataset.meta.stats, new_meta.root)
+
+    # Group episodes by source video file (same chunk/file layout)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
+        file_idx = ep[f"videos/{source_key}/file_index"]
+        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
+
+    # -- Encode SAM2-tracked stream videos ----------------------------------
+    sam2_video_metadata: dict[int, dict] = {}
+
+    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
+        sorted(file_to_episodes.items()), desc="Encoding SAM2 stream videos"
+    ):
+        assert new_meta.video_path is not None
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+        )
+
+        episode_timestamps = _encode_frame_list_video(
+            frames_per_episode=processed_frames,
+            episode_lengths=episode_lengths,
+            episodes=eps_in_file,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
+            sam2_video_metadata[ep_idx] = {
+                f"videos/{new_key}/chunk_index": src_chunk_idx,
+                f"videos/{new_key}/file_index": src_file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Update episodes metadata with new video columns
+    logging.info("Updating episodes metadata with SAM2 stream info …")
+    _update_episodes_metadata_with_video(new_meta, sam2_video_metadata)
+
+    # Populate video codec/resolution info
+    first_sam2_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_sam2_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_sam2_path)
+
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+        }
+    )
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"SAM2 stream '{new_key}' added. Dataset saved to: {output_dir}")
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+def _propagate_mask_across_frames(
+    video_segmenter,
+    frames_bgr: list[np.ndarray],
+    initial_mask: np.ndarray,
+    obj_id: int = 1,
+) -> list[np.ndarray]:
+    """Use SAM2 video predictor to propagate a mask from the first frame.
+
+    Instead of using point prompts (which ``interactive_select`` does not
+    return), we supply the confirmed binary mask directly via
+    ``add_new_mask``.
+
+    Args:
+        video_segmenter: A :class:`SAM2VideoSegmenter` instance.
+        frames_bgr: All BGR frames of the episode.
+        initial_mask: Binary mask (H, W, uint8) for frame 0.
+        obj_id: Object identifier for tracking.
+
+    Returns:
+        List of binary masks (H, W, uint8), one per frame.
+    """
+    import tempfile
+
+    import cv2
+    import torch
+
+    if not frames_bgr:
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="sam2_video_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        for i, bgr in enumerate(frames_bgr):
+            # SAM2 video predictor reads JPEG files from a directory
+            cv2.imwrite(str(tmp_path / f"{i:06d}.jpg"), bgr)
+
+        with torch.inference_mode(), torch.autocast(
+            video_segmenter.device, dtype=torch.bfloat16
+        ):
+            state = video_segmenter.predictor.init_state(video_path=str(tmp_path))
+
+            # Supply the initial mask on frame 0
+            mask_tensor = torch.from_numpy(initial_mask.astype(np.float32)).to(
+                video_segmenter.device
+            )
+            video_segmenter.predictor.add_new_mask(
+                state,
+                frame_idx=0,
+                obj_id=obj_id,
+                mask=mask_tensor,
+            )
+
+            # Propagate across all frames
+            masks_by_frame: dict[int, np.ndarray] = {}
+            for frame_idx, _obj_ids, video_res_masks in (
+                video_segmenter.predictor.propagate_in_video(state)
+            ):
+                mask = (video_res_masks[0] > 0.5).cpu().numpy().astype(np.uint8)
+                masks_by_frame[frame_idx] = mask
+
+    n = len(frames_bgr)
+    h, w = frames_bgr[0].shape[:2]
+    return [masks_by_frame.get(i, np.zeros((h, w), dtype=np.uint8)) for i in range(n)]
+
+
+def _preview_and_confirm_rerun(
+    episode_idx: int,
+    source_frames: list[np.ndarray],
+    segmented_frames: list[np.ndarray],
+    masks: list[np.ndarray],
+    fps: int,
+    source_key: str,
+    new_key: str,
+) -> bool:
+    """Show a side-by-side preview in Rerun and ask for user confirmation.
+
+    Logs the original frames, segmented frames, and masks to Rerun,
+    then prompts the user on the console.
+
+    Args:
+        episode_idx: Episode index (for display purposes).
+        source_frames: Original BGR frames.
+        segmented_frames: SAM2-highlighted BGR frames.
+        masks: Binary masks (H, W, uint8).
+        fps: Frames per second (for timeline).
+        source_key: Name of the source stream.
+        new_key: Name of the new stream.
+
+    Returns:
+        ``True`` if the user accepted, ``False`` otherwise.
+    """
+    import gc
+
+    import cv2
+    import rerun as rr
+
+    session_name = f"SAM2 Preview – Episode {episode_idx}"
+    rr.init(session_name, spawn=True)
+    gc.collect()
+
+    for i in range(len(source_frames)):
+        timestamp = i / fps
+        rr.set_time("frame_index", sequence=i)
+        rr.set_time("timestamp", timestamp=timestamp)
+
+        # Log original frame (BGR → RGB for rerun)
+        if source_frames[i] is not None:
+            src_rgb = cv2.cvtColor(source_frames[i], cv2.COLOR_BGR2RGB)
+            rr.log(f"{source_key}/original", rr.Image(src_rgb))
+
+        # Log segmented frame
+        seg_rgb = cv2.cvtColor(segmented_frames[i], cv2.COLOR_BGR2RGB)
+        rr.log(f"{new_key}/segmented", rr.Image(seg_rgb))
+
+        # Log mask as a greyscale image (if available)
+        if masks and i < len(masks) and masks[i] is not None:
+            rr.log(f"{new_key}/mask", rr.Image(masks[i] * 255))
+
+    # Ask user for confirmation
+    while True:
+        answer = input(
+            f"\n  Episode {episode_idx}: Accept SAM2 tracking result? [y/n]: "
+        ).strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        elif answer in ("n", "no"):
+            return False
+        print("  Please enter 'y' or 'n'.")

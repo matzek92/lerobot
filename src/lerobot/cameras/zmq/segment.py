@@ -34,7 +34,9 @@ Usage example::
 from __future__ import annotations
 
 import logging
+import tempfile
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -144,6 +146,37 @@ def highlight_object_fadeout(
     return result
 
 
+def highlight_object_overlay(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    color: tuple[int, int, int] = (0, 180, 0),
+    alpha: float = 0.4,
+) -> np.ndarray:
+    """Create a copy of *image* with a semi-transparent colour overlay on the mask.
+
+    Unlike :func:`highlight_object_fadeout` (intended for episode video streams),
+    this variant is designed for **interactive selection**: the segmented region
+    is tinted with a translucent colour and no contours are drawn, giving a
+    clean visual cue without obscuring detail.
+
+    Args:
+        image: Input image (H, W, 3), BGR recommended.
+        mask: Binary mask (H, W) with dtype ``uint8`` – ``1`` for the object,
+            ``0`` for background.
+        color: BGR colour of the overlay.
+        alpha: Opacity of the overlay (0.0 = invisible, 1.0 = fully opaque).
+
+    Returns:
+        A copy of *image* with the overlay applied.
+    """
+    result = image.copy()
+    overlay = result.copy()
+    overlay[mask.astype(bool)] = color
+    cv2.addWeighted(overlay, alpha, result, 1 - alpha, 0, result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Abstract segmenter
 # ---------------------------------------------------------------------------
@@ -243,6 +276,108 @@ class SAM2Segmenter(BaseSegmenter):
 
 
 # ---------------------------------------------------------------------------
+# Variant 2 – SAM2 Video Predictor (temporal propagation)
+# ---------------------------------------------------------------------------
+
+class SAM2VideoSegmenter:
+    """SAM2 video predictor for propagating a segmentation mask across frames.
+
+    Given a list of BGR frames and initial point prompts on the first frame,
+    this class uses the SAM2 video predictor to track the object through
+    every frame.
+
+    Args:
+        model_id: HuggingFace model identifier
+            (default: ``"facebook/sam2.1-hiera-small"``).
+        device: Torch device string.  Defaults to ``"cuda"`` when available,
+            otherwise ``"cpu"``.
+    """
+
+    def __init__(
+        self,
+        model_id: str = "facebook/sam2.1-hiera-small",
+        device: str | None = None,
+    ):
+        try:
+            import torch
+            from sam2.sam2_video_predictor import SAM2VideoPredictor  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "SAM2 is required for video segmentation.  "
+                "Install it with:  pip install sam-2"
+            ) from e
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info("Loading SAM2 video predictor '%s' on %s …", model_id, device)
+        self.predictor = SAM2VideoPredictor.from_pretrained(model_id)
+        self.predictor.to(device)
+        self.device = device
+        logger.info("SAM2 video predictor loaded.")
+
+    def propagate(
+        self,
+        frames_bgr: list[np.ndarray],
+        points: list[list[int]],
+        labels: list[int],
+        obj_id: int = 1,
+    ) -> list[np.ndarray]:
+        """Propagate a segmentation mask across all frames.
+
+        The points/labels are applied to the first frame and then tracked
+        through every subsequent frame using SAM2's temporal propagation.
+
+        Args:
+            frames_bgr: List of BGR images (H, W, 3), one per frame.
+            points: List of ``[x, y]`` pixel coordinates on the first frame.
+            labels: Per-point label – ``1`` = foreground, ``0`` = background.
+            obj_id: Object identifier (default: ``1``).
+
+        Returns:
+            List of binary masks ``(H, W, uint8)`` – one per frame.
+        """
+        import torch
+
+        if not frames_bgr:
+            return []
+
+        # SAM2 video predictor expects a directory of JPEG frames.
+        # We write frames to a temporary directory, run propagation,
+        # then clean up.
+        with tempfile.TemporaryDirectory(prefix="sam2_video_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            for i, bgr in enumerate(frames_bgr):
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                cv2.imwrite(str(tmp_path / f"{i:06d}.jpg"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
+                state = self.predictor.init_state(video_path=str(tmp_path))
+
+                # Add point prompts on first frame
+                pts = np.array(points, dtype=np.float32)
+                lbls = np.array(labels, dtype=np.int32)
+                self.predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=0,
+                    obj_id=obj_id,
+                    points=pts,
+                    labels=lbls,
+                    normalize_coords=False,
+                )
+
+                # Propagate across all frames
+                masks_by_frame: dict[int, np.ndarray] = {}
+                for frame_idx, _obj_ids, video_res_masks in self.predictor.propagate_in_video(state):
+                    # video_res_masks: (num_objects, H, W) float tensor
+                    mask = (video_res_masks[0] > 0.5).cpu().numpy().astype(np.uint8)
+                    masks_by_frame[frame_idx] = mask
+
+        # Return masks in frame order
+        return [masks_by_frame.get(i, np.zeros_like(masks_by_frame[0])) for i in range(len(frames_bgr))]
+
+
+# ---------------------------------------------------------------------------
 # Interactive point selection
 # ---------------------------------------------------------------------------
 
@@ -252,11 +387,14 @@ def interactive_select(
     window_name: str = "Select Object",
     fade_pixels: int = 16,
     min_brightness: float = 0.0,
+    overlay_color: tuple[int, int, int] = (0, 180, 0),
+    overlay_alpha: float = 0.4,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Open an OpenCV window for interactive point selection with live preview.
 
-    The segmented region stays unchanged; the background fades to black over
-    *fade_pixels* distance from the mask boundary.
+    During selection the mask is shown as a semi-transparent colour overlay
+    (via :func:`highlight_object_overlay`).  The final confirmed image uses
+    :func:`highlight_object_fadeout` for the episode video stream.
 
     Controls:
       - **Left click** – add foreground point (green dot)
@@ -273,9 +411,12 @@ def interactive_select(
         segmenter: A :class:`BaseSegmenter` instance (e.g. :class:`SAM2Segmenter`).
         window_name: Title of the OpenCV window.
         fade_pixels: Number of pixels over which brightness fades from full
-            (at the mask boundary) to *min_brightness*.  0 = hard cut.
+            (at the mask boundary) to *min_brightness* in the **final** image.
         min_brightness: Brightness multiplier for pixels beyond the fade zone
-            (0.0 = black, 1.0 = unchanged).
+            in the **final** image (0.0 = black, 1.0 = unchanged).
+        overlay_color: BGR colour of the semi-transparent mask overlay shown
+            during interactive selection.
+        overlay_alpha: Opacity of the overlay during selection.
 
     Returns:
         ``(highlighted_bgr, mask)`` on success, or ``(None, None)`` if the
@@ -407,11 +548,11 @@ def interactive_select(
 
     try:
         while True:
-            # Build full-resolution annotated frame
+            # Build full-resolution annotated frame (interactive overlay)
             if current_mask is not None:
-                base = highlight_object_fadeout(
+                base = highlight_object_overlay(
                     image_bgr, current_mask,
-                    fade_pixels=fade_pixels, min_brightness=min_brightness,
+                    color=overlay_color, alpha=overlay_alpha,
                 )
             else:
                 base = image_bgr.copy()

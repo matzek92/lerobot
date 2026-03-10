@@ -185,6 +185,7 @@ from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
     add_guide_stream,
     add_initial_scene_segmentation_stream,
+    add_sam2_stream,
     convert_image_to_video_dataset,
     delete_episodes,
     merge_datasets,
@@ -290,6 +291,28 @@ class AddInitialSceneSegmentationStreamConfig(OperationConfig):
     interactive OpenCV window where the user segments an object with SAM2.
     The highlighted image is then repeated for the full episode duration,
     just like :class:`AddGuideStreamConfig`.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    fade_pixels: int = 16
+    min_brightness: float = 0.0
+
+
+@OperationConfig.register_subclass("add_sam2_stream")
+@dataclass
+class AddSam2StreamConfig(OperationConfig):
+    """Configuration for adding a SAM2 video-tracked segmentation stream.
+
+    For each episode the first frame of ``source_key`` is shown in an
+    interactive OpenCV window where the user selects an object.  SAM2's
+    video predictor then propagates the mask across **every** frame of
+    the episode.  The result is previewed in Rerun before the user
+    confirms or rejects it.
     """
 
     source_key: str = ""
@@ -736,6 +759,56 @@ def handle_add_initial_scene_segmentation_stream(cfg: EditDatasetConfig) -> None
         logging.info("Successfully pushed to hub!")
 
 
+def handle_add_sam2_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddSam2StreamConfig):
+        raise ValueError("Operation config must be AddSam2StreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError(
+            "operation.source_key must be specified for "
+            "add_sam2_stream operation"
+        )
+    if not cfg.operation.new_key:
+        raise ValueError(
+            "operation.new_key must be specified for "
+            "add_sam2_stream operation"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Adding SAM2-tracked stream '{cfg.operation.new_key}' "
+        f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+    )
+    new_dataset = add_sam2_stream(
+        dataset=dataset,
+        source_key=cfg.operation.source_key,
+        new_key=cfg.operation.new_key,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+        g=cfg.operation.g,
+        crf=cfg.operation.crf,
+        fade_pixels=cfg.operation.fade_pixels,
+        min_brightness=cfg.operation.min_brightness,
+    )
+
+    logging.info(f"Dataset with SAM2 stream saved to {output_dir}")
+    logging.info(f"Video keys: {new_dataset.meta.video_keys}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
+        logging.info("Successfully pushed to hub!")
+
+
 def handle_info(cfg: EditDatasetConfig):
     if not isinstance(cfg.operation, InfoConfig):
         raise ValueError("Operation config must be InfoConfig")
@@ -788,6 +861,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_add_guide_stream(cfg)
     elif operation_type == "add_initial_scene_segmentation_stream":
         handle_add_initial_scene_segmentation_stream(cfg)
+    elif operation_type == "add_sam2_stream":
+        handle_add_sam2_stream(cfg)
     elif operation_type == "info":
         handle_info(cfg)
     else:
