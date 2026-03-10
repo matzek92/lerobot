@@ -2331,3 +2331,360 @@ def add_guide_stream(
 
     logging.info(f"Guide stream '{new_key}' added. Dataset saved to: {output_dir}")
     return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Helper: decode the first frame of an episode from a video stream
+# ---------------------------------------------------------------------------
+
+def _decode_first_frame_bgr(
+    dataset: LeRobotDataset,
+    episode_idx: int,
+    source_key: str,
+) -> np.ndarray:
+    """Decode the first frame of an episode's video stream and return it as BGR numpy array.
+
+    Args:
+        dataset: Source dataset.
+        episode_idx: Episode index.
+        source_key: Video key to read from.
+
+    Returns:
+        BGR image as numpy array (H, W, 3), dtype uint8.
+    """
+    import av
+    import cv2
+
+    ep = dataset.meta.episodes[episode_idx]
+    src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
+    src_video_rel_path = dataset.meta.get_video_file_path(episode_idx, source_key)
+    src_video_path = dataset.root / src_video_rel_path
+
+    first_frame_image = None
+    with av.open(str(src_video_path)) as container:
+        stream = container.streams.video[0]
+        seek_us = int(src_from_ts * 1_000_000)
+        container.seek(seek_us, backward=True, stream=stream)
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                if frame is not None:
+                    first_frame_image = frame.to_image().convert("RGB")
+                    break
+            if first_frame_image is not None:
+                break
+
+    if first_frame_image is None:
+        raise ValueError(
+            f"Could not decode first frame for episode {episode_idx}, "
+            f"source key '{source_key}'"
+        )
+
+    frame_rgb = np.array(first_frame_image)
+    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+
+# ---------------------------------------------------------------------------
+# Helper: encode pre-computed frames as a static (repeated) video
+# ---------------------------------------------------------------------------
+
+def _encode_precomputed_guide_video(
+    precomputed_frames: dict[int, np.ndarray],
+    episode_lengths: dict[int, int],
+    episodes: list[int],
+    output_path: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> list[tuple[float, float]]:
+    """Encode a video by repeating pre-computed BGR frames for each episode.
+
+    Behaves like :func:`_encode_guide_video` but uses frames that have already
+    been processed (e.g. segmented / highlighted) instead of decoding them from
+    a source video.
+
+    Args:
+        precomputed_frames: Mapping of episode index → BGR image (H, W, 3).
+        episode_lengths: Mapping of episode index → number of frames.
+        episodes: Ordered list of episode indices for this video file.
+        output_path: Destination video file path.
+        fps: Frames per second.
+        vcodec, pix_fmt, g, crf: Encoding parameters.
+
+    Returns:
+        List of ``(from_timestamp, to_timestamp)`` tuples, one per episode.
+    """
+    from fractions import Fraction
+
+    import av
+    import cv2
+
+    vcodec = resolve_vcodec(vcodec)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    codec_options = _get_codec_options(vcodec, g, crf)
+
+    episode_timestamps: list[tuple[float, float]] = []
+    cumulative_ts = 0.0
+    frame_count = 0
+
+    with av.open(str(output_path), mode="w") as out_container:
+        out_stream = None
+
+        for ep_idx in episodes:
+            bgr_frame = precomputed_frames[ep_idx]
+            ep_length = episode_lengths[ep_idx]
+
+            # Convert BGR → RGB PIL → av.VideoFrame
+            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            from PIL import Image
+            pil_image = Image.fromarray(rgb_frame)
+
+            if out_stream is None:
+                out_stream = out_container.add_stream(
+                    vcodec, rate=fps_fraction, options=codec_options
+                )
+                out_stream.width = pil_image.width
+                out_stream.height = pil_image.height
+                out_stream.pix_fmt = pix_fmt
+
+            av_frame = av.VideoFrame.from_image(pil_image)
+            av_frame = av_frame.reformat(
+                width=out_stream.width, height=out_stream.height, format=pix_fmt
+            )
+            frame_array = av_frame.to_ndarray(format=pix_fmt)
+
+            for _ in range(ep_length):
+                frame_to_encode = av.VideoFrame.from_ndarray(frame_array, format=pix_fmt)
+                frame_to_encode.pts = frame_count
+                for pkt in out_stream.encode(frame_to_encode):
+                    out_container.mux(pkt)
+                frame_count += 1
+
+            from_ts = cumulative_ts
+            to_ts = cumulative_ts + ep_length / fps
+            episode_timestamps.append((from_ts, to_ts))
+            cumulative_ts = to_ts
+
+        if out_stream is not None:
+            for pkt in out_stream.encode(None):
+                out_container.mux(pkt)
+
+    return episode_timestamps
+
+
+# ---------------------------------------------------------------------------
+# Public API: add_initial_scene_segmentation_stream
+# ---------------------------------------------------------------------------
+
+def add_initial_scene_segmentation_stream(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+    fade_pixels: int = 16,
+    min_brightness: float = 0.0,
+) -> LeRobotDataset:
+    """Add a segmented scene stream by interactively segmenting the first frame of each episode.
+
+    For every episode the first frame of ``source_key`` is shown in an
+    interactive OpenCV window.  The user selects an object using SAM2
+    point-prompt segmentation (left click = foreground, right click =
+    background, Enter = confirm).  The resulting highlighted image —
+    with the selected object in full colour and a gradient fade-to-black
+    around it — is then repeated for the full duration of that episode,
+    exactly like :func:`add_guide_stream`.
+
+    If the user cancels segmentation for an episode (presses Escape),
+    the raw first frame is used instead (no highlighting).
+
+    Args:
+        dataset: Source LeRobotDataset (must contain at least one video key).
+        source_key: Existing video key whose first frame is segmented
+            (e.g. ``"observation.images.laptop"``).
+        new_key: Name for the new segmented stream
+            (e.g. ``"observation.images.segmented_laptop"``).
+        output_dir: Directory for the new dataset.  Defaults to
+            ``HF_LEROBOT_HOME / repo_id``.
+        repo_id: Repository ID for the new dataset.  Defaults to
+            ``"<original>_with_seg"``.
+        vcodec: Video codec (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format (default: ``"yuv420p"``).
+        g: GOP size (default: ``2``).
+        crf: Constant rate factor (default: ``30``).
+        fade_pixels: Number of pixels over which brightness fades from full
+            (at the mask edge) to *min_brightness* (default: ``80``).
+        min_brightness: Brightness multiplier beyond the fade zone
+            (``0.0`` = black, ``1.0`` = unchanged; default: ``0.0``).
+
+    Returns:
+        New :class:`LeRobotDataset` with the segmented stream added.
+    """
+    from lerobot.cameras.zmq.segment import SAM2Segmenter, interactive_select
+
+    if source_key not in dataset.meta.video_keys:
+        raise ValueError(
+            f"source_key '{source_key}' must be a video stream. "
+            f"Video keys in dataset: {dataset.meta.video_keys}."
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_with_seg"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # -- Phase 1: interactive segmentation of the first frame per episode ----
+    logging.info("Loading SAM2 segmenter …")
+    segmenter = SAM2Segmenter()
+
+    precomputed_frames: dict[int, np.ndarray] = {}
+    episode_lengths: dict[int, int] = {}
+    total_episodes = dataset.meta.total_episodes
+
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        episode_lengths[ep_idx] = ep["length"]
+
+        first_frame_bgr = _decode_first_frame_bgr(dataset, ep_idx, source_key)
+
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            "Select object to segment (Enter=confirm, Esc=skip)"
+        )
+        highlighted, mask = interactive_select(
+            first_frame_bgr,
+            segmenter,
+            window_name=f"Segment Episode {ep_idx} ({source_key})",
+            fade_pixels=fade_pixels,
+            min_brightness=min_brightness,
+        )
+
+        if highlighted is not None:
+            precomputed_frames[ep_idx] = highlighted
+        else:
+            # User cancelled – fall back to the raw first frame
+            logging.info(f"Episode {ep_idx}: segmentation skipped, using raw frame.")
+            precomputed_frames[ep_idx] = first_frame_bgr
+
+    # -- Phase 2: build new dataset (same structure as add_guide_stream) -----
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy parquet data files
+    logging.info("Copying data files …")
+    data_dir_src = dataset.root / DATA_DIR
+    data_dir_dst = new_meta.root / DATA_DIR
+    shutil.copytree(data_dir_src, data_dir_dst)
+
+    # Copy existing video files
+    logging.info("Copying existing video files …")
+    _copy_videos(dataset, new_meta)
+
+    # Copy episodes metadata
+    logging.info("Copying episodes metadata …")
+    episodes_src = dataset.root / "meta" / "episodes"
+    episodes_dst = new_meta.root / "meta" / "episodes"
+    if episodes_src.exists():
+        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
+
+    # Copy tasks and stats
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+    if dataset.meta.stats is not None:
+        write_stats(dataset.meta.stats, new_meta.root)
+
+    # Group episodes by source video file (same chunk/file layout)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
+        file_idx = ep[f"videos/{source_key}/file_index"]
+        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
+
+    # -- Phase 3: encode segmented stream videos -----------------------------
+    fps = dataset.meta.fps
+    seg_video_metadata: dict[int, dict] = {}
+
+    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
+        sorted(file_to_episodes.items()), desc="Encoding segmented stream videos"
+    ):
+        assert new_meta.video_path is not None
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+        )
+
+        episode_timestamps = _encode_precomputed_guide_video(
+            precomputed_frames=precomputed_frames,
+            episode_lengths=episode_lengths,
+            episodes=eps_in_file,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
+            seg_video_metadata[ep_idx] = {
+                f"videos/{new_key}/chunk_index": src_chunk_idx,
+                f"videos/{new_key}/file_index": src_file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Update episodes metadata with new video columns
+    logging.info("Updating episodes metadata with segmented stream info …")
+    _update_episodes_metadata_with_video(new_meta, seg_video_metadata)
+
+    # Populate video codec/resolution info
+    first_seg_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_seg_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_seg_path)
+
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+        }
+    )
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"Segmented stream '{new_key}' added. Dataset saved to: {output_dir}")
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)

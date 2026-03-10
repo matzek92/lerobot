@@ -88,6 +88,62 @@ def highlight_object(
     return result
 
 
+def highlight_object_fadeout(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    fade_pixels: int = 16,
+    min_brightness: float = 0.0,
+) -> np.ndarray:
+    """Create a copy of *image* with a gradient fade-to-black around the segmented region.
+
+    The segmented region (``mask == 1``) is left completely unchanged.
+    Starting at the mask boundary, pixel brightness fades linearly to
+    *min_brightness* over *fade_pixels* distance.  Pixels beyond the fade
+    zone are multiplied by *min_brightness* (0 = pure black).
+
+    Args:
+        image: Input image (H, W, 3), BGR recommended.
+        mask: Binary mask (H, W) with dtype ``uint8`` – ``1`` for the object,
+            ``0`` for background.
+        fade_pixels: Number of pixels over which the brightness fades from
+            1.0 (at the mask boundary) to *min_brightness*.  Larger values
+            give a softer, wider gradient.
+        min_brightness: Brightness multiplier for pixels at or beyond the
+            fade distance (0.0 = black, 1.0 = unchanged).
+
+    Returns:
+        A copy of *image* with the fade-out applied.
+    """
+    mask_u8 = mask.astype(np.uint8)
+
+    # Compute distance from each background pixel to the nearest mask pixel.
+    # cv2.distanceTransform only works on the *zero* pixels, so we pass the
+    # inverted mask (background = 0 inside distanceTransform's input means
+    # "compute distance for these").  We invert: bg=255 → 0, fg=0 → 255,
+    # but distanceTransform measures distance of 0-pixels to nearest non-zero.
+    # So: pass (1 - mask) → fg pixels become 0, bg pixels become 1.
+    # distanceTransform measures distance of 0-pixels — that's the fg, not
+    # what we want.  Instead: pass mask itself as src; then distance is
+    # computed for the 0-valued (background) pixels.
+    dist = cv2.distanceTransform(1 - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    # dist[fg] == 0, dist[bg] == euclidean distance to nearest fg pixel
+
+    # Build per-pixel brightness multiplier
+    if fade_pixels > 0:
+        # Linear fade: 1.0 at distance 0 → min_brightness at distance >= fade_pixels
+        alpha = 1.0 - (1.0 - min_brightness) * np.clip(dist / fade_pixels, 0.0, 1.0)
+    else:
+        # No fade: foreground = 1.0, background = min_brightness
+        alpha = np.where(mask_u8, 1.0, min_brightness)
+
+    # Foreground pixels must stay fully unchanged
+    alpha[mask_u8 == 1] = 1.0
+
+    result = (image.astype(np.float32) * alpha[:, :, np.newaxis]).astype(np.uint8)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Abstract segmenter
 # ---------------------------------------------------------------------------
@@ -194,12 +250,20 @@ def interactive_select(
     image_bgr: np.ndarray,
     segmenter: BaseSegmenter,
     window_name: str = "Select Object",
+    fade_pixels: int = 16,
+    min_brightness: float = 0.0,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Open an OpenCV window for interactive point selection with live preview.
+
+    The segmented region stays unchanged; the background fades to black over
+    *fade_pixels* distance from the mask boundary.
 
     Controls:
       - **Left click** – add foreground point (green dot)
       - **Right click** – add background point (red dot)
+      - **Mouse wheel** – zoom in / out (centred on cursor)
+      - **Middle mouse drag** – pan the view
+      - **R** – reset zoom & pan to default
       - **Z** – undo last point
       - **Enter** – confirm selection
       - **Escape** – cancel
@@ -208,6 +272,10 @@ def interactive_select(
         image_bgr: BGR image (H, W, 3) – typically the latest live frame.
         segmenter: A :class:`BaseSegmenter` instance (e.g. :class:`SAM2Segmenter`).
         window_name: Title of the OpenCV window.
+        fade_pixels: Number of pixels over which brightness fades from full
+            (at the mask boundary) to *min_brightness*.  0 = hard cut.
+        min_brightness: Brightness multiplier for pixels beyond the fade zone
+            (0.0 = black, 1.0 = unchanged).
 
     Returns:
         ``(highlighted_bgr, mask)`` on success, or ``(None, None)`` if the
@@ -216,6 +284,49 @@ def interactive_select(
     points: list[list[int]] = []
     labels: list[int] = []
     current_mask: np.ndarray | None = None
+
+    # -- View state (zoom & pan) -------------------------------------------
+    # ``scale`` = display pixels per image pixel (1.0 = 1:1).
+    # ``offset_x/y`` = image coordinate mapped to the top-left display corner.
+    img_h, img_w = image_bgr.shape[:2]
+    scale: float = 1.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    zoom_min: float = 0.25
+    zoom_max: float = 16.0
+    zoom_step: float = 1.15  # multiplicative factor per scroll tick
+
+    # Pan state (middle-button drag)
+    panning: bool = False
+    pan_start_x: int = 0
+    pan_start_y: int = 0
+    pan_start_offset_x: float = 0.0
+    pan_start_offset_y: float = 0.0
+
+    # -- coordinate helpers ------------------------------------------------
+
+    def _display_to_image(dx: int, dy: int) -> tuple[int, int]:
+        """Convert display (window) pixel to image pixel."""
+        ix = int(round(dx / scale + offset_x))
+        iy = int(round(dy / scale + offset_y))
+        return ix, iy
+
+    def _image_to_display(ix: float, iy: float) -> tuple[int, int]:
+        """Convert image pixel to display (window) pixel."""
+        dx = int(round((ix - offset_x) * scale))
+        dy = int(round((iy - offset_y) * scale))
+        return dx, dy
+
+    def _clamp_offset() -> None:
+        """Keep the view within reasonable bounds of the image."""
+        nonlocal offset_x, offset_y
+        visible_w = img_w / scale if scale > 0 else img_w
+        visible_h = img_h / scale if scale > 0 else img_h
+        # Allow panning up to half the visible area beyond each edge
+        offset_x = max(-visible_w * 0.5, min(offset_x, img_w - visible_w * 0.5))
+        offset_y = max(-visible_h * 0.5, min(offset_y, img_h - visible_h * 0.5))
+
+    # -- mask update -------------------------------------------------------
 
     def _update_mask() -> None:
         nonlocal current_mask
@@ -228,45 +339,118 @@ def interactive_select(
         else:
             current_mask = None
 
+    # -- mouse callback ----------------------------------------------------
+
     def _on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+        nonlocal scale, offset_x, offset_y
+        nonlocal panning, pan_start_x, pan_start_y
+        nonlocal pan_start_offset_x, pan_start_offset_y
+
+        # --- Zoom (mouse wheel) ---
+        if event == cv2.EVENT_MOUSEWHEEL:
+            # Zoom centred on cursor position
+            img_cx, img_cy = _display_to_image(x, y)
+            if flags > 0:
+                scale = min(scale * zoom_step, zoom_max)
+            else:
+                scale = max(scale / zoom_step, zoom_min)
+            # Adjust offset so cursor stays on the same image pixel
+            offset_x = img_cx - x / scale
+            offset_y = img_cy - y / scale
+            _clamp_offset()
+            return
+
+        # --- Pan (middle button drag) ---
+        if event == cv2.EVENT_MBUTTONDOWN:
+            panning = True
+            pan_start_x = x
+            pan_start_y = y
+            pan_start_offset_x = offset_x
+            pan_start_offset_y = offset_y
+            return
+
+        if event == cv2.EVENT_MBUTTONUP:
+            panning = False
+            return
+
+        if event == cv2.EVENT_MOUSEMOVE and panning:
+            dx = x - pan_start_x
+            dy = y - pan_start_y
+            offset_x = pan_start_offset_x - dx / scale
+            offset_y = pan_start_offset_y - dy / scale
+            _clamp_offset()
+            return
+
+        # --- Point placement (left / right click) ---
         if event == cv2.EVENT_LBUTTONDOWN:
-            points.append([x, y])
-            labels.append(1)
-            _update_mask()
+            ix, iy = _display_to_image(x, y)
+            if 0 <= ix < img_w and 0 <= iy < img_h:
+                points.append([ix, iy])
+                labels.append(1)
+                _update_mask()
         elif event == cv2.EVENT_RBUTTONDOWN:
-            points.append([x, y])
-            labels.append(0)
-            _update_mask()
+            ix, iy = _display_to_image(x, y)
+            if 0 <= ix < img_w and 0 <= iy < img_h:
+                points.append([ix, iy])
+                labels.append(0)
+                _update_mask()
 
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, _on_mouse)
 
     instructions = (
-        "L-click: foreground | R-click: background | "
-        "Z: undo | Enter: confirm | Esc: cancel"
+        "L-click: fg | R-click: bg | Wheel: zoom | Mid-drag: pan | "
+        "R: reset view | Z: undo | Enter: confirm | Esc: cancel"
     )
 
     result: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
 
     try:
         while True:
-            # Build display frame
+            # Build full-resolution annotated frame
             if current_mask is not None:
-                display = highlight_object(image_bgr, current_mask)
+                base = highlight_object_fadeout(
+                    image_bgr, current_mask,
+                    fade_pixels=fade_pixels, min_brightness=min_brightness,
+                )
             else:
-                display = image_bgr.copy()
+                base = image_bgr.copy()
 
-            # Draw points
+            # Draw points (in image space)
             for pt, lbl in zip(points, labels):
                 colour = (0, 255, 0) if lbl == 1 else (0, 0, 255)
-                cv2.circle(display, (pt[0], pt[1]), 6, colour, -1)
-                cv2.circle(display, (pt[0], pt[1]), 7, (255, 255, 255), 1)
+                radius = max(1, int(6 / scale)) if scale > 1 else 6
+                thickness = max(1, int(1 / scale)) if scale > 1 else 1
+                cv2.circle(base, (pt[0], pt[1]), radius, colour, -1)
+                cv2.circle(base, (pt[0], pt[1]), radius + 1, (255, 255, 255), thickness)
 
-            # Instructions bar
+            # Apply zoom & pan via affine warp
+            display_h, display_w = img_h, img_w
+            M = np.array(
+                [[scale, 0, -offset_x * scale],
+                 [0, scale, -offset_y * scale]],
+                dtype=np.float64,
+            )
+            display = cv2.warpAffine(
+                base, M, (display_w, display_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(40, 40, 40),
+            )
+
+            # Instructions bar (always in display space)
             cv2.putText(
                 display, instructions,
                 (10, display.shape[0] - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+
+            # Zoom indicator
+            zoom_text = f"Zoom: {scale:.1f}x"
+            cv2.putText(
+                display, zoom_text,
+                (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
             )
 
             cv2.imshow(window_name, display)
@@ -274,7 +458,10 @@ def interactive_select(
 
             if key == 13:  # Enter – confirm
                 if current_mask is not None:
-                    highlighted = highlight_object(image_bgr, current_mask)
+                    highlighted = highlight_object_fadeout(
+                        image_bgr, current_mask,
+                        fade_pixels=fade_pixels, min_brightness=min_brightness,
+                    )
                     result = (highlighted, current_mask)
                 break
             elif key == 27:  # Escape – cancel
@@ -284,6 +471,11 @@ def interactive_select(
                     points.pop()
                     labels.pop()
                     _update_mask()
+            elif key in (ord("r"), ord("R")):
+                # Reset zoom & pan
+                scale = 1.0
+                offset_x = 0.0
+                offset_y = 0.0
     finally:
         cv2.destroyWindow(window_name)
 
