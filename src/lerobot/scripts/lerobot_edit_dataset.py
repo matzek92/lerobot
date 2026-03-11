@@ -62,6 +62,20 @@ Append trimmed episodes from a source dataset to an existing target dataset (inc
         --operation.episode_trim_specs '{"0": [5, 3]}' \
         --operation.append_to_repo_id lerobot/pusht_existing
 
+Split an episode into two at a specific frame position:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_split \
+        --operation.type split_episodes \
+        --operation.episode_split_specs '{"0": 15}'
+
+Split multiple episodes at specific frame positions:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_split \
+        --operation.type split_episodes \
+        --operation.episode_split_specs '{"0": 15, "3": 20}'
+
 Split dataset by fractions:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -193,6 +207,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    split_episodes,
     trim_episodes,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -217,6 +232,15 @@ class TrimEpisodesConfig(OperationConfig):
     # When set, trimmed episodes are appended to this existing repo instead of
     # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
     append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("split_episodes")
+@dataclass
+class SplitEpisodesConfig(OperationConfig):
+    # Keys are episode indices as strings because JSON/CLI argument parsing
+    # always produces string dict keys. They are converted to int in
+    # handle_split_episodes before being passed to split_episodes().
+    episode_split_specs: dict[str, int] | None = None
 
 
 @OperationConfig.register_subclass("delete_episodes")
@@ -474,6 +498,46 @@ def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
 
         logging.info(f"Dataset saved to {output_dir}")
 
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+
+
+def handle_split_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, SplitEpisodesConfig):
+        raise ValueError("Operation config must be SplitEpisodesConfig")
+
+    if not cfg.operation.episode_split_specs:
+        raise ValueError(
+            "episode_split_specs must be specified for split_episodes operation. "
+            "Provide a dict mapping episode indices to split frame positions, e.g. "
+            '\'{"0": 15, "3": 20}\''
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    # Convert string keys to int (CLI args come in as strings)
+    episode_split_specs: dict[int, int] = {int(k): int(v) for k, v in cfg.operation.episode_split_specs.items()}
+
+    logging.info(f"Splitting episodes {list(episode_split_specs.keys())} in {cfg.repo_id}")
+    result_dataset = split_episodes(
+        dataset,
+        episode_split_specs=episode_split_specs,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
     logging.info(
         f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
     )
@@ -920,6 +984,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_delete_episodes(cfg)
     elif operation_type == "trim_episodes":
         handle_trim_episodes(cfg)
+    elif operation_type == "split_episodes":
+        handle_split_episodes(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":

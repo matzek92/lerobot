@@ -149,6 +149,58 @@ lerobot-edit-dataset \
 - `--operation.append_to_repo_id` and `--new_repo_id` are mutually exclusive.
 - The original source dataset is never modified.
 
+#### Split Episodes
+
+Split a single episode at a specific frame position into two separate consecutive episodes.
+This is useful when a recording accidentally captured two distinct tasks or when you want to
+divide a long episode into smaller independent episodes.
+
+The frame at the split position becomes the **first** frame of the second new episode.
+
+**Recommended workflow:**
+
+1. Visualize the episode to find the exact split frame:
+
+```bash
+lerobot-dataset-viz \
+    --repo-id lerobot/pusht \
+    --episode-index 0
+```
+
+2. Split the episode at the identified frame position:
+
+```bash
+# Split episode 0 at frame 15 (frames 0-14 → new episode 0, frames 15-end → new episode 1)
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht \
+    --new_repo_id lerobot/pusht_split \
+    --operation.type split_episodes \
+    --operation.episode_split_specs '{"0": 15}'
+
+# Split multiple episodes at different frame positions
+lerobot-edit-dataset \
+    --repo_id lerobot/pusht \
+    --new_repo_id lerobot/pusht_split \
+    --operation.type split_episodes \
+    --operation.episode_split_specs '{"0": 15, "3": 20}'
+```
+
+**Format of `--operation.episode_split_specs`:**
+
+```
+'{"<episode_index>": <split_frame>, ...}'
+```
+
+| Field | Meaning |
+|---|---|
+| `episode_index` | Zero-based episode number (as a string in JSON) |
+| `split_frame` | Zero-based frame index at which to split. Must be ≥ 1 and < episode length. |
+
+- Episodes not listed in `episode_split_specs` are copied unchanged.
+- Each listed episode becomes **two** consecutive episodes in the output dataset; all
+  subsequent episode indices are shifted accordingly.
+- The total number of frames in the output dataset equals the total frames in the source.
+
 #### Split Dataset
 
 Divide a dataset into multiple subsets.

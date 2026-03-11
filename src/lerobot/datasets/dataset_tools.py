@@ -363,6 +363,148 @@ def trim_episodes(
     return write_target
 
 
+def split_episodes(
+    dataset: LeRobotDataset,
+    episode_split_specs: dict[int, int],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Split episodes at specific frame positions into two separate episodes each.
+
+    Creates a new dataset where each episode listed in *episode_split_specs* is split
+    into two consecutive episodes at the given frame index.  Episodes not listed in
+    *episode_split_specs* are copied unchanged.
+
+    The frame at *split_frame* becomes the **first** frame of the second sub-episode
+    (i.e. the split point is exclusive for the first part and inclusive for the second).
+
+    Args:
+        dataset: The source LeRobotDataset.
+        episode_split_specs: Dict mapping episode index to the zero-based frame index at
+            which to split the episode.  For an episode of length ``N``, valid split
+            positions are ``1 … N-1`` (you need at least one frame in each half).
+        output_dir: Directory to save the new dataset. If None, uses default location
+            based on *repo_id*.
+        repo_id: Repository ID for the new dataset. If None, appends ``"_split"`` to the
+            source repo_id.
+
+    Returns:
+        :class:`LeRobotDataset` containing the resulting episodes.
+
+    Example::
+
+        # Split episode 2 at frame 15 (frames 0-14 → ep 2, frames 15-end → ep 3)
+        new_dataset = split_episodes(
+            dataset,
+            episode_split_specs={2: 15},
+            output_dir="./output",
+        )
+    """
+    if not episode_split_specs:
+        raise ValueError("No split specifications provided")
+
+    valid_indices = set(range(dataset.meta.total_episodes))
+    invalid = set(episode_split_specs.keys()) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.meta.root)
+
+    for ep_idx, split_frame in episode_split_specs.items():
+        if split_frame <= 0:
+            raise ValueError(
+                f"split_frame must be >= 1 for episode {ep_idx}, got {split_frame}. "
+                "The first part must contain at least one frame."
+            )
+        ep_length = dataset.meta.episodes[ep_idx]["length"]
+        if split_frame >= ep_length:
+            raise ValueError(
+                f"split_frame {split_frame} is out of range for episode {ep_idx} "
+                f"with length {ep_length}. "
+                "The second part must contain at least one frame."
+            )
+
+    logging.info(f"Splitting {len(episode_split_specs)} episodes in dataset")
+
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_split"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    write_target = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=user_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(dataset.meta.video_keys) > 0,
+    )
+
+    dataset._ensure_hf_dataset_loaded()
+
+    has_video = len(dataset.meta.video_keys) > 0
+
+    for ep_idx in tqdm(range(dataset.meta.total_episodes), desc="Splitting episodes"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        split_frame = episode_split_specs.get(ep_idx, None)
+
+        # Determine the segments: a list of (start, end) relative frame offsets.
+        if split_frame is not None:
+            segments = [(0, split_frame), (split_frame, ep_length)]
+        else:
+            segments = [(0, ep_length)]
+
+        video_frames: dict[str, np.ndarray] = {}
+        if has_video:
+            for vid_key in dataset.meta.video_keys:
+                from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+                kept_timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+                video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+                frames_tensor = decode_video_frames(
+                    video_path, kept_timestamps, dataset.tolerance_s, dataset.video_backend
+                )
+                video_frames[vid_key] = frames_tensor.numpy()
+
+        for seg_start, seg_end in segments:
+            for i in range(seg_start, seg_end):
+                abs_idx = from_idx + i
+                item = dataset.hf_dataset[abs_idx]
+
+                frame: dict = {}
+                frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+                for vid_key in dataset.meta.video_keys:
+                    frame[vid_key] = video_frames[vid_key][i]
+
+                for key, feat in user_features.items():
+                    if feat["dtype"] == "video":
+                        continue
+                    elif feat["dtype"] == "image":
+                        frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                    else:
+                        frame[key] = item[key].numpy()
+
+                write_target.add_frame(frame)
+
+            write_target.save_episode()
+
+    write_target.finalize()
+    write_target._ensure_hf_dataset_loaded()
+
+    n_new_episodes = write_target.meta.total_episodes
+    logging.info(
+        f"Created split dataset: {n_new_episodes} episodes, {write_target.meta.total_frames} frames "
+        f"(split {len(episode_split_specs)} episode(s) into two)"
+    )
+    return write_target
+
+
 def split_dataset(
     dataset: LeRobotDataset,
     splits: dict[str, float | list[int]],

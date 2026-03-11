@@ -30,6 +30,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    split_episodes,
     trim_episodes,
 )
 from lerobot.scripts.lerobot_edit_dataset import convert_image_to_video_dataset
@@ -434,6 +435,134 @@ def test_trim_episodes_append_incremental(sample_dataset, tmp_path, empty_lerobo
     # After second append: 6 + 5 = 11 episodes, 57 + 7 + 4×10 = 104 frames
     assert target_dataset.meta.total_episodes == 11
     assert target_dataset.meta.total_frames == 104
+
+
+def test_split_episodes_single(sample_dataset, tmp_path):
+    """Test splitting a single episode at a specified frame position."""
+    output_dir = tmp_path / "split_ep"
+
+    # Split episode 2 at frame 4 → first part: 4 frames, second part: 6 frames
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={2: 4},
+        output_dir=output_dir,
+    )
+
+    # 5 original episodes + 1 extra (one episode split into two) = 6 episodes
+    assert new_dataset.meta.total_episodes == 6
+    # Total frames unchanged: 50
+    assert new_dataset.meta.total_frames == 50
+    assert len(new_dataset) == 50
+
+    # Episode indices should be contiguous 0..5
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(6))
+
+    # Episode 2 (first part) should have 4 frames
+    ep2_frames = _get_episode_frame_indices(new_dataset, 2)
+    assert len(ep2_frames) == 4
+
+    # Episode 3 (second part, was the remainder of original episode 2) should have 6 frames
+    ep3_frames = _get_episode_frame_indices(new_dataset, 3)
+    assert len(ep3_frames) == 6
+
+    # frame_index for the first part should start at 0
+    frame_indices_ep2 = [int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep2_frames]
+    assert frame_indices_ep2 == list(range(4))
+
+    # frame_index for the second part should also start at 0
+    frame_indices_ep3 = [int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep3_frames]
+    assert frame_indices_ep3 == list(range(6))
+
+    # timestamp for the first part should start at 0.0
+    timestamps_ep2 = [float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep2_frames]
+    assert timestamps_ep2[0] == pytest.approx(0.0, abs=1e-4)
+
+    # timestamp for the second part should also start at 0.0
+    timestamps_ep3 = [float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep3_frames]
+    assert timestamps_ep3[0] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_split_episodes_multiple(sample_dataset, tmp_path):
+    """Test splitting multiple episodes at once."""
+    output_dir = tmp_path / "split_multi"
+
+    # Split episode 0 at frame 3 and episode 4 at frame 7
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={0: 3, 4: 7},
+        output_dir=output_dir,
+    )
+
+    # 5 original + 2 extra = 7 episodes
+    assert new_dataset.meta.total_episodes == 7
+    # Total frames unchanged: 50
+    assert new_dataset.meta.total_frames == 50
+
+    # Episode 0 → first part: 3 frames
+    ep0_frames = _get_episode_frame_indices(new_dataset, 0)
+    assert len(ep0_frames) == 3
+
+    # Episode 1 (was second part of original ep 0) → 7 frames
+    ep1_frames = _get_episode_frame_indices(new_dataset, 1)
+    assert len(ep1_frames) == 7
+
+
+def test_split_episodes_preserves_unchanged_episodes(sample_dataset, tmp_path):
+    """Test that episodes not listed in split specs are copied unchanged."""
+    output_dir = tmp_path / "split_unchanged"
+
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={0: 5},
+        output_dir=output_dir,
+    )
+
+    # Episode 0 was split → episodes 1..5 are the original episodes 1..4 (shifted by 1)
+    # Each should have 10 frames
+    for ep_idx in range(2, 6):
+        ep_frames = _get_episode_frame_indices(new_dataset, ep_idx)
+        assert len(ep_frames) == 10, f"Episode {ep_idx} should have 10 frames, got {len(ep_frames)}"
+
+
+def test_split_episodes_invalid_index(sample_dataset, tmp_path):
+    """Test that an invalid episode index raises an error."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={99: 5},
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_split_frame_zero(sample_dataset, tmp_path):
+    """Test that split_frame=0 raises an error."""
+    with pytest.raises(ValueError, match="split_frame must be >= 1"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={0: 0},
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_split_frame_too_large(sample_dataset, tmp_path):
+    """Test that split_frame >= episode length raises an error."""
+    with pytest.raises(ValueError, match="out of range"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={0: 10},  # episode length is 10; 10 >= 10
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_empty_specs(sample_dataset, tmp_path):
+    """Test that empty split specs raises an error."""
+    with pytest.raises(ValueError, match="No split specifications provided"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={},
+            output_dir=tmp_path / "split_err",
+        )
 
 
 def test_split_by_episodes(sample_dataset, tmp_path):
