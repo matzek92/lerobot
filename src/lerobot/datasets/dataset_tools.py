@@ -2893,7 +2893,7 @@ def add_sam2_stream(
     from lerobot.cameras.zmq.segment import (
         SAM2Segmenter,
         SAM2VideoSegmenter,
-        highlight_object_fadeout,
+        highlight_object_overlay,
         interactive_select,
     )
 
@@ -2973,10 +2973,7 @@ def add_sam2_stream(
         # Apply highlighting to each frame (in-place to save memory)
         highlighted_frames: list[np.ndarray] = []
         for i in range(len(frames_bgr)):
-            highlighted = highlight_object_fadeout(
-                frames_bgr[i], masks[i],
-                fade_pixels=fade_pixels, min_brightness=min_brightness,
-            )
+            highlighted = highlight_object_overlay(frames_bgr[i], masks[i])
             highlighted_frames.append(highlighted)
             # Free source frame and mask immediately after use
             frames_bgr[i] = None  # type: ignore[assignment]
@@ -3241,10 +3238,292 @@ def _preview_and_confirm_rerun(
     # Ask user for confirmation
     while True:
         answer = input(
-            f"\n  Episode {episode_idx}: Accept SAM2 tracking result? [y/n]: "
+            f"\n  Episode {episode_idx}: Accept tracking result? [y/n]: "
         ).strip().lower()
         if answer in ("y", "yes"):
             return True
         elif answer in ("n", "no"):
             return False
         print("  Please enter 'y' or 'n'.")
+
+
+# ---------------------------------------------------------------------------
+# SAM3 stream
+# ---------------------------------------------------------------------------
+
+
+def add_sam3_stream(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+    fade_pixels: int = 16,
+    min_brightness: float = 0.0,
+) -> LeRobotDataset:
+    """Add a SAM3 video-tracked segmentation stream to the dataset.
+
+    For every episode:
+
+    1. The first frame of ``source_key`` is shown in an interactive OpenCV
+       window where the user selects an object using SAM3 point prompts.
+    2. The SAM3 **video predictor** propagates the mask across all frames
+       of the episode using instance interactivity.
+    3. Each frame is highlighted (foreground preserved, background faded).
+    4. The resulting stream is previewed in **Rerun** so the user can
+       inspect the tracking quality.
+    5. The user confirms (``y``) or rejects (``n``) the result.
+       If rejected, the raw source frames are used for that episode.
+    6. The confirmed frames are encoded as a new video stream.
+
+    Args:
+        dataset: Source LeRobotDataset (must contain at least one video key).
+        source_key: Existing video key to segment
+            (e.g. ``"observation.images.top_back"``).
+        new_key: Name for the new segmented stream
+            (e.g. ``"observation.images.sam3_top_back"``).
+        output_dir: Directory for the new dataset.
+        repo_id: Repository ID for the new dataset.
+        vcodec: Video codec (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format (default: ``"yuv420p"``).
+        g: GOP size (default: ``2``).
+        crf: Constant rate factor (default: ``30``).
+        fade_pixels: Number of pixels for the fade-to-black gradient.
+        min_brightness: Background brightness (0.0 = black).
+
+    Returns:
+        New :class:`LeRobotDataset` with the SAM3-tracked stream added.
+    """
+    import gc
+    import time
+
+    import rerun as rr
+
+    from lerobot.cameras.zmq.segment import (
+        SAM3Segmenter,
+        SAM3VideoSegmenter,
+        highlight_object_overlay,
+        interactive_select,
+    )
+
+    if source_key not in dataset.meta.video_keys:
+        raise ValueError(
+            f"source_key '{source_key}' must be a video stream. "
+            f"Video keys in dataset: {dataset.meta.video_keys}."
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_sam3"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # -- Load models --------------------------------------------------------
+    logging.info("Loading SAM3 image segmenter (for interactive selection) …")
+    image_segmenter = SAM3Segmenter()
+    logging.info("Loading SAM3 video segmenter (for temporal propagation) …")
+    video_segmenter = SAM3VideoSegmenter()
+
+    total_episodes = dataset.meta.total_episodes
+    fps = dataset.meta.fps
+    processed_frames: dict[int, list[np.ndarray]] = {}
+    episode_lengths: dict[int, int] = {}
+
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        ep_length = ep["length"]
+        episode_lengths[ep_idx] = ep_length
+
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Decoding {ep_length} frames from '{source_key}' …"
+        )
+        frames_bgr = _decode_all_frames_bgr(dataset, ep_idx, source_key)
+
+        if not frames_bgr:
+            logging.warning(f"Episode {ep_idx}: no frames decoded, skipping.")
+            processed_frames[ep_idx] = []
+            continue
+
+        # -- Step 1: interactive selection on first frame -------------------
+        # SAM3 video predictor needs points, not a mask, so use return_points=True
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            "Select object to track (Enter=confirm, Esc=skip)"
+        )
+        _highlighted, mask, sel_points, sel_labels = interactive_select(
+            frames_bgr[0],
+            image_segmenter,
+            window_name=f"SAM3 Track – Episode {ep_idx} ({source_key})",
+            fade_pixels=fade_pixels,
+            min_brightness=min_brightness,
+            return_points=True,
+        )
+
+        if mask is None or not sel_points:
+            logging.info(f"Episode {ep_idx}: selection cancelled, using raw frames.")
+            processed_frames[ep_idx] = frames_bgr
+            continue
+
+        # -- Step 2: propagate using SAM3 video predictor -------------------
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Propagating mask across {ep_length} frames with SAM3 video predictor …"
+        )
+        masks = video_segmenter.propagate(frames_bgr, sel_points, sel_labels)
+        del mask  # free initial mask
+
+        # Apply highlighting to each frame (in-place to save memory)
+        highlighted_frames: list[np.ndarray] = []
+        for i in range(len(frames_bgr)):
+            highlighted = highlight_object_overlay(frames_bgr[i], masks[i])
+            highlighted_frames.append(highlighted)
+            # Free source frame and mask immediately after use
+            frames_bgr[i] = None  # type: ignore[assignment]
+            masks[i] = None  # type: ignore[assignment]
+
+        # Re-decode source frames (lightweight) only for the Rerun preview
+        logging.info(
+            f"Episode {ep_idx + 1}/{total_episodes}: "
+            "Starting Rerun preview …"
+        )
+        preview_source = _decode_all_frames_bgr(dataset, ep_idx, source_key)
+        accepted = _preview_and_confirm_rerun(
+            episode_idx=ep_idx,
+            source_frames=preview_source,
+            segmented_frames=highlighted_frames,
+            masks=[],  # masks already freed
+            fps=fps,
+            source_key=source_key,
+            new_key=new_key,
+        )
+        del preview_source
+
+        if accepted:
+            logging.info(f"Episode {ep_idx}: confirmed ✓")
+            processed_frames[ep_idx] = highlighted_frames
+        else:
+            logging.info(f"Episode {ep_idx}: rejected, using raw frames.")
+            del highlighted_frames
+            processed_frames[ep_idx] = _decode_all_frames_bgr(
+                dataset, ep_idx, source_key
+            )
+
+    # -- Build new dataset structure ----------------------------------------
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy parquet data files
+    logging.info("Copying data files …")
+    data_dir_src = dataset.root / DATA_DIR
+    data_dir_dst = new_meta.root / DATA_DIR
+    shutil.copytree(data_dir_src, data_dir_dst)
+
+    # Copy existing video files
+    logging.info("Copying existing video files …")
+    _copy_videos(dataset, new_meta)
+
+    # Copy episodes metadata
+    logging.info("Copying episodes metadata …")
+    episodes_src = dataset.root / "meta" / "episodes"
+    episodes_dst = new_meta.root / "meta" / "episodes"
+    if episodes_src.exists():
+        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
+
+    # Copy tasks and stats
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+    if dataset.meta.stats is not None:
+        write_stats(dataset.meta.stats, new_meta.root)
+
+    # Group episodes by source video file (same chunk/file layout)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    for ep_idx in range(total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
+        file_idx = ep[f"videos/{source_key}/file_index"]
+        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
+
+    # -- Encode SAM3-tracked stream videos ----------------------------------
+    sam3_video_metadata: dict[int, dict] = {}
+
+    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
+        sorted(file_to_episodes.items()), desc="Encoding SAM3 stream videos"
+    ):
+        assert new_meta.video_path is not None
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+        )
+
+        episode_timestamps = _encode_frame_list_video(
+            frames_per_episode=processed_frames,
+            episode_lengths=episode_lengths,
+            episodes=eps_in_file,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
+            sam3_video_metadata[ep_idx] = {
+                f"videos/{new_key}/chunk_index": src_chunk_idx,
+                f"videos/{new_key}/file_index": src_file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Update episodes metadata with new video columns
+    logging.info("Updating episodes metadata with SAM3 stream info …")
+    _update_episodes_metadata_with_video(new_meta, sam3_video_metadata)
+
+    # Populate video codec/resolution info
+    first_sam3_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_sam3_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_sam3_path)
+
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+        }
+    )
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"SAM3 stream '{new_key}' added. Dataset saved to: {output_dir}")
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)

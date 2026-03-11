@@ -117,6 +117,9 @@ def highlight_object_fadeout(
     Returns:
         A copy of *image* with the fade-out applied.
     """
+    # Ensure mask is 2-D (H, W) – squeeze any trailing singleton channel dim
+    if mask.ndim == 3:
+        mask = mask.squeeze(axis=-1)
     mask_u8 = mask.astype(np.uint8)
 
     # Compute distance from each background pixel to the nearest mask pixel.
@@ -378,6 +381,204 @@ class SAM2VideoSegmenter:
 
 
 # ---------------------------------------------------------------------------
+# Variant 3 – SAM3 Image Segmenter (point-based)
+# ---------------------------------------------------------------------------
+
+class SAM3Segmenter(BaseSegmenter):
+    """Segment Anything 3 (SAM3) segmenter using point prompts.
+
+    The model is loaded from the HuggingFace Hub on first instantiation.
+    Uses the SAM3 tracker's interactive image predictor for point-based
+    segmentation.
+
+    Args:
+        device: Torch device string.  Defaults to ``"cuda"`` when available,
+            otherwise ``"cpu"``.
+    """
+
+    def __init__(self, device: str | None = None):
+        try:
+            import torch
+            from sam3.model_builder import build_tracker
+            from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor  # noqa: F401
+        except ImportError as e:
+            print(e)
+            raise ImportError(
+                "SAM3 is required for Variant 3 segmentation.  "
+                "Install it with:  pip install sam3"
+            ) from e
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info("Loading SAM3 image predictor on %s …", device)
+        from sam3.model_builder import build_sam3_image_model
+
+        sam3_model = build_sam3_image_model(
+            device=device,
+            eval_mode=True,
+            enable_inst_interactivity=True,
+        )
+        self.predictor = sam3_model.inst_interactive_predictor
+        self._current_image_id: int | None = None
+        logger.info("SAM3 image predictor loaded.")
+
+    # -- BaseSegmenter interface -------------------------------------------
+
+    def segment(
+        self,
+        image_bgr: np.ndarray,
+        points: list[list[int]],
+        labels: list[int],
+    ) -> np.ndarray:
+        """Segment using SAM3 with point prompts.
+
+        Internally converts BGR → RGB for the model and caches the image
+        embedding so that subsequent calls with different points on the same
+        image are fast.
+        """
+        img_id = id(image_bgr)
+        if img_id != self._current_image_id:
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            self.predictor.set_image(image_rgb)
+            self._current_image_id = img_id
+
+        masks, scores, _ = self.predictor.predict(
+            point_coords=np.array(points, dtype=np.float32),
+            point_labels=np.array(labels, dtype=np.int32),
+            multimask_output=True,
+            normalize_coords=True,
+        )
+
+        best_idx = int(scores.argmax())
+        return masks[best_idx].astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Variant 4 – SAM3 Video Predictor (temporal propagation)
+# ---------------------------------------------------------------------------
+
+class SAM3VideoSegmenter:
+    """SAM3 video predictor for propagating a segmentation mask across frames.
+
+    Given a list of BGR frames and initial point prompts on the first frame,
+    this class uses the SAM3 video predictor (with instance interactivity)
+    to track the object through every frame.
+
+    The model is loaded from the HuggingFace Hub (``facebook/sam3``) on
+    first instantiation.
+
+    Args:
+        device: Torch device string.  Defaults to ``"cuda"`` when available,
+            otherwise ``"cpu"``.
+    """
+
+    def __init__(self, device: str | None = None):
+        try:
+            import torch
+            from sam3.model.sam3_video_predictor import Sam3VideoPredictor  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "SAM3 is required for video segmentation.  "
+                "Install it with:  pip install sam3"
+            ) from e
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info("Loading SAM3 video predictor on %s …", device)
+        self.predictor = Sam3VideoPredictor()
+        self.device = device
+        logger.info("SAM3 video predictor loaded.")
+
+    def propagate(
+        self,
+        frames_bgr: list[np.ndarray],
+        points: list[list[int]],
+        labels: list[int],
+        obj_id: int = 1,
+    ) -> list[np.ndarray]:
+        """Propagate a segmentation mask across all frames.
+
+        The points/labels are applied to the first frame and then tracked
+        through every subsequent frame using SAM3's temporal propagation.
+
+        Args:
+            frames_bgr: List of BGR images (H, W, 3), one per frame.
+            points: List of ``[x, y]`` pixel coordinates on the first frame.
+            labels: Per-point label – ``1`` = foreground, ``0`` = background.
+            obj_id: Object identifier (default: ``1``).
+
+        Returns:
+            List of binary masks ``(H, W, uint8)`` – one per frame.
+        """
+        import torch
+        from PIL import Image
+
+        if not frames_bgr:
+            return []
+
+        h, w = frames_bgr[0].shape[:2]
+
+        # SAM3 accepts a list of PIL images as resource_path
+        pil_frames = [
+            Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            for bgr in frames_bgr
+        ]
+
+        # Convert pixel coordinates to relative coordinates (0~1)
+        rel_points = [[x / w, y / h] for x, y in points]
+
+        with torch.inference_mode():
+            result = self.predictor.handle_request({
+                "type": "start_session",
+                "resource_path": pil_frames,
+            })
+            session_id = result["session_id"]
+
+            try:
+                # Add point prompt on first frame
+                self.predictor.handle_request({
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "points": rel_points,
+                    "point_labels": labels,
+                    "obj_id": obj_id,
+                })
+
+                # Propagate across all frames
+                masks_by_frame: dict[int, np.ndarray] = {}
+                for response in self.predictor.handle_stream_request({
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": "forward",
+                    "start_frame_index": 0,
+                }):
+                    frame_idx = response["frame_index"]
+                    outputs = response["outputs"]
+                    if outputs is not None and len(outputs["out_binary_masks"]) > 0:
+                        # Find the mask for our obj_id
+                        obj_ids = outputs["out_obj_ids"]
+                        binary_masks = outputs["out_binary_masks"]
+                        for oid, mask in zip(obj_ids, binary_masks):
+                            if oid == obj_id:
+                                masks_by_frame[frame_idx] = mask.astype(np.uint8)
+                                break
+                        else:
+                            masks_by_frame[frame_idx] = np.zeros((h, w), dtype=np.uint8)
+                    else:
+                        masks_by_frame[frame_idx] = np.zeros((h, w), dtype=np.uint8)
+            finally:
+                self.predictor.handle_request({
+                    "type": "close_session",
+                    "session_id": session_id,
+                })
+
+        return [masks_by_frame.get(i, np.zeros((h, w), dtype=np.uint8)) for i in range(len(frames_bgr))]
+
+
+# ---------------------------------------------------------------------------
 # Interactive point selection
 # ---------------------------------------------------------------------------
 
@@ -389,7 +590,8 @@ def interactive_select(
     min_brightness: float = 0.0,
     overlay_color: tuple[int, int, int] = (0, 180, 0),
     overlay_alpha: float = 0.4,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+    return_points: bool = False,
+) -> tuple[np.ndarray | None, np.ndarray | None] | tuple[np.ndarray | None, np.ndarray | None, list[list[int]], list[int]]:
     """Open an OpenCV window for interactive point selection with live preview.
 
     During selection the mask is shown as a semi-transparent colour overlay
@@ -417,10 +619,13 @@ def interactive_select(
         overlay_color: BGR colour of the semi-transparent mask overlay shown
             during interactive selection.
         overlay_alpha: Opacity of the overlay during selection.
+        return_points: If ``True``, also return the point coordinates and
+            labels used for segmentation (needed for SAM3 video propagation).
 
     Returns:
         ``(highlighted_bgr, mask)`` on success, or ``(None, None)`` if the
-        user cancelled.
+        user cancelled.  When *return_points* is ``True`` the return value
+        is ``(highlighted_bgr, mask, points, labels)`` instead.
     """
     points: list[list[int]] = []
     labels: list[int] = []
@@ -620,4 +825,6 @@ def interactive_select(
     finally:
         cv2.destroyWindow(window_name)
 
+    if return_points:
+        return (*result, list(points), list(labels))
     return result
