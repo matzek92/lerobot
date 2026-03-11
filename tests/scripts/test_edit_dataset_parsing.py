@@ -28,6 +28,7 @@ from lerobot.scripts.lerobot_edit_dataset import (
     OperationConfig,
     RemoveFeatureConfig,
     SplitConfig,
+    SplitEpisodesConfig,
 )
 
 
@@ -44,6 +45,7 @@ class TestOperationTypeParsing:
         [
             ("delete_episodes", DeleteEpisodesConfig),
             ("split", SplitConfig),
+            ("split_episodes", SplitEpisodesConfig),
             ("merge", MergeConfig),
             ("remove_feature", RemoveFeatureConfig),
             ("modify_tasks", ModifyTasksConfig),
@@ -63,6 +65,7 @@ class TestOperationTypeParsing:
         [
             ("delete_episodes", DeleteEpisodesConfig),
             ("split", SplitConfig),
+            ("split_episodes", SplitEpisodesConfig),
             ("merge", MergeConfig),
             ("remove_feature", RemoveFeatureConfig),
             ("modify_tasks", ModifyTasksConfig),
