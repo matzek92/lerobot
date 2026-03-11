@@ -3175,6 +3175,8 @@ def _propagate_mask_across_frames(
                 video_segmenter.predictor.propagate_in_video(state)
             ):
                 mask = (video_res_masks[0] > 0.5).cpu().numpy().astype(np.uint8)
+                if mask.ndim == 3:
+                    mask = mask.squeeze(0)
                 masks_by_frame[frame_idx] = mask
 
     n = len(frames_bgr)

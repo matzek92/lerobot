@@ -173,6 +173,8 @@ def highlight_object_overlay(
     Returns:
         A copy of *image* with the overlay applied.
     """
+    if mask.ndim == 3:
+        mask = mask.squeeze(axis=-1) if mask.shape[-1] == 1 else mask.squeeze(axis=0)
     result = image.copy()
     overlay = result.copy()
     overlay[mask.astype(bool)] = color
