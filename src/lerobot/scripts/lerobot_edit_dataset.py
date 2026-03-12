@@ -144,6 +144,14 @@ Convert image dataset to video format and push to hub:
         --operation.type convert_image_to_video \
         --push_to_hub true
 
+Add a black stream (all-black frames with the same resolution as a source camera):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_black \
+        --operation.type add_black_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.black_top
+
 Add a guide stream (repeats the first frame of a camera throughout each episode):
     lerobot-edit-dataset \
         --repo_id my_user/my_video_dataset \
@@ -197,6 +205,7 @@ import draccus
 
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
+    add_black_stream,
     add_guide_stream,
     add_initial_scene_segmentation_stream,
     add_sam2_stream,
@@ -287,6 +296,25 @@ class ConvertImageToVideoConfig(OperationConfig):
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
+
+
+@OperationConfig.register_subclass("add_black_stream")
+@dataclass
+class AddBlackStreamConfig(OperationConfig):
+    """Configuration for adding an all-black video stream to a dataset.
+
+    The new stream contains only black (zero-valued) frames for every frame of
+    every episode.  Its spatial dimensions are taken from ``source_key`` so the
+    stream is resolution-compatible with the rest of the dataset.  Useful as a
+    placeholder when a second camera is not yet available.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
 
 
 @OperationConfig.register_subclass("add_guide_stream")
@@ -753,6 +781,49 @@ def _get_dataset_size(repo_path):
     return total
 
 
+def handle_add_black_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddBlackStreamConfig):
+        raise ValueError("Operation config must be AddBlackStreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError("operation.source_key must be specified for add_black_stream operation")
+
+    if not cfg.operation.new_key:
+        raise ValueError("operation.new_key must be specified for add_black_stream operation")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Adding black stream '{cfg.operation.new_key}' "
+        f"(resolution from '{cfg.operation.source_key}') to {cfg.repo_id}"
+    )
+    new_dataset = add_black_stream(
+        dataset=dataset,
+        source_key=cfg.operation.source_key,
+        new_key=cfg.operation.new_key,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+        g=cfg.operation.g,
+        crf=cfg.operation.crf,
+    )
+
+    logging.info(f"Dataset with black stream saved to {output_dir}")
+    logging.info(f"Video keys: {new_dataset.meta.video_keys}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
 def handle_add_guide_stream(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, AddGuideStreamConfig):
         raise ValueError("Operation config must be AddGuideStreamConfig")
@@ -996,6 +1067,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "add_black_stream":
+        handle_add_black_stream(cfg)
     elif operation_type == "add_guide_stream":
         handle_add_guide_stream(cfg)
     elif operation_type == "add_initial_scene_segmentation_stream":
