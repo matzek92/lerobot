@@ -211,6 +211,7 @@ lerobot-info="lerobot.scripts.lerobot_info:main"
 lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
+lerobot-dataset-hub="lerobot.scripts.lerobot_dataset_hub:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-image-server-client="lerobot.cameras.zmq.image_server_client:main"
 
