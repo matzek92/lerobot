@@ -2476,6 +2476,291 @@ def add_guide_stream(
 
 
 # ---------------------------------------------------------------------------
+# Helper: encode a video containing only black frames
+# ---------------------------------------------------------------------------
+
+
+def _encode_black_video(
+    episodes: list[int],
+    episode_lengths: dict[int, int],
+    width: int,
+    height: int,
+    output_path: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> list[tuple[float, float]]:
+    """Create a video file containing black frames for multiple episodes.
+
+    All frames are pure black (zero-valued).  The spatial dimensions are given
+    by ``width`` and ``height``.  Multiple episodes are concatenated into the
+    same video file, matching the chunked storage layout used by other video
+    streams.
+
+    Args:
+        episodes: Ordered list of episode indices to include in this video file.
+        episode_lengths: Mapping from episode index to number of frames.
+        width: Frame width in pixels.
+        height: Frame height in pixels.
+        output_path: Destination video file path.
+        fps: Frames per second for the output video.
+        vcodec: Video codec (default: libsvtav1).
+        pix_fmt: Pixel format (default: yuv420p).
+        g: GOP size (default: 2).
+        crf: Constant rate factor for quality (default: 30).
+
+    Returns:
+        List of ``(from_timestamp, to_timestamp)`` tuples (one per episode).
+    """
+    from fractions import Fraction
+
+    import av
+    from PIL import Image
+
+    vcodec = resolve_vcodec(vcodec)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    codec_options = _get_codec_options(vcodec, g, crf)
+
+    episode_timestamps: list[tuple[float, float]] = []
+    cumulative_ts = 0.0
+    frame_count = 0
+
+    with av.open(str(output_path), mode="w") as out_container:
+        out_stream = out_container.add_stream(vcodec, rate=fps_fraction, options=codec_options)
+        out_stream.width = width
+        out_stream.height = height
+        out_stream.pix_fmt = pix_fmt
+
+        # Build the black frame once in the target pixel format.
+        # av.VideoFrame.from_ndarray() is cheap so we create a fresh frame
+        # object per encoded frame (avoids PTS mutation issues with some encoders).
+        black_pil = Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8))
+        black_av_frame = av.VideoFrame.from_image(black_pil)
+        black_av_frame = black_av_frame.reformat(width=width, height=height, format=pix_fmt)
+        black_array = black_av_frame.to_ndarray(format=pix_fmt)
+
+        for ep_idx in episodes:
+            ep_length = episode_lengths[ep_idx]
+            from_ts = cumulative_ts
+
+            for _ in range(ep_length):
+                frame_to_encode = av.VideoFrame.from_ndarray(black_array, format=pix_fmt)
+                frame_to_encode.pts = frame_count
+                for pkt in out_stream.encode(frame_to_encode):
+                    out_container.mux(pkt)
+                frame_count += 1
+
+            to_ts = cumulative_ts + ep_length / fps
+            episode_timestamps.append((from_ts, to_ts))
+            cumulative_ts = to_ts
+
+        # Flush encoder
+        for pkt in out_stream.encode(None):
+            out_container.mux(pkt)
+
+    return episode_timestamps
+
+
+# ---------------------------------------------------------------------------
+# Public API: add_black_stream
+# ---------------------------------------------------------------------------
+
+
+def add_black_stream(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> LeRobotDataset:
+    """Add an all-black video stream to a LeRobotDataset.
+
+    Every frame of every episode in the new stream is a pure black image.
+    The spatial dimensions (width × height) are taken from ``source_key``
+    so the new stream is compatible with any downstream code that expects
+    the same resolution as the source camera.
+
+    This is useful as a placeholder stream when a second camera view is not
+    yet available, or to provide a neutral reference channel that does not
+    carry any visual information.
+
+    The new video files follow the same chunk/file layout as ``source_key``.
+
+    Args:
+        dataset: The source LeRobotDataset (must contain at least one video key).
+        source_key: Existing video key whose resolution is used for the black
+            stream (e.g. ``"observation.images.top"``).
+        new_key: Name for the new black video stream
+            (e.g. ``"observation.images.black_top"``).
+        output_dir: Directory for the new dataset.  If ``None``, defaults to
+            ``HF_LEROBOT_HOME / repo_id``.
+        repo_id: Repository ID for the new dataset.  If ``None``,
+            ``"_with_black"`` is appended to the original repo ID.
+        vcodec: Video codec for the black stream (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format for the black stream (default: ``"yuv420p"``).
+        g: GOP size for encoding (default: ``2``).
+        crf: Constant rate factor / quality setting (default: ``30``).
+
+    Returns:
+        New :class:`LeRobotDataset` with the black stream added.
+
+    Example::
+
+        dataset = LeRobotDataset("my_user/my_dataset")
+        new_dataset = add_black_stream(
+            dataset,
+            source_key="observation.images.top",
+            new_key="observation.images.black_top",
+        )
+    """
+    if source_key not in dataset.meta.video_keys:
+        raise ValueError(
+            f"source_key '{source_key}' must be a video stream. "
+            f"Video keys in dataset: {dataset.meta.video_keys}. "
+            "If source_key is stored as images, first convert to video using "
+            "convert_image_to_video_dataset()."
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_with_black"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # Build new features dict: copy source feature spec (shape/dtype) for the black stream
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    # Create destination metadata
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy parquet data files (no column changes needed for a video-only addition)
+    logging.info("Copying data files…")
+    data_dir_src = dataset.root / DATA_DIR
+    data_dir_dst = new_meta.root / DATA_DIR
+    shutil.copytree(data_dir_src, data_dir_dst)
+
+    # Copy existing video files
+    logging.info("Copying existing video files…")
+    _copy_videos(dataset, new_meta)
+
+    # Copy episodes metadata (will be extended with black-stream columns below)
+    logging.info("Copying episodes metadata…")
+    episodes_src = dataset.root / "meta" / "episodes"
+    episodes_dst = new_meta.root / "meta" / "episodes"
+    if episodes_src.exists():
+        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
+
+    # Copy tasks and stats
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+    if dataset.meta.stats is not None:
+        write_stats(dataset.meta.stats, new_meta.root)
+
+    # Determine black frame dimensions from source_key feature shape (H, W, C)
+    source_shape = dataset.meta.features[source_key]["shape"]
+    height, width = source_shape[0], source_shape[1]
+
+    # Group episodes by their source video file (same chunk/file layout)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    episode_lengths: dict[int, int] = {}
+    for ep_idx in range(dataset.meta.total_episodes):
+        ep = dataset.meta.episodes[ep_idx]
+        episode_lengths[ep_idx] = ep["length"]
+        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
+        file_idx = ep[f"videos/{source_key}/file_index"]
+        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
+
+    fps = dataset.meta.fps
+    black_video_metadata: dict[int, dict] = {}
+
+    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
+        sorted(file_to_episodes.items()), desc="Encoding black stream videos"
+    ):
+        assert new_meta.video_path is not None
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+        )
+
+        episode_timestamps = _encode_black_video(
+            episodes=eps_in_file,
+            episode_lengths=episode_lengths,
+            width=width,
+            height=height,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
+            black_video_metadata[ep_idx] = {
+                f"videos/{new_key}/chunk_index": src_chunk_idx,
+                f"videos/{new_key}/file_index": src_file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Extend episodes metadata parquet files with the new video columns
+    logging.info("Updating episodes metadata with black stream info…")
+    _update_episodes_metadata_with_video(new_meta, black_video_metadata)
+
+    # Populate video codec/resolution info for the new key
+    first_black_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_black_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_black_path)
+
+    # Propagate existing video feature info (codec metadata) from source dataset
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    # Update dataset-level counters
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+        }
+    )
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"Black stream '{new_key}' added. Dataset saved to: {output_dir}")
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+# ---------------------------------------------------------------------------
 # Helper: decode the first frame of an episode from a video stream
 # ---------------------------------------------------------------------------
 
