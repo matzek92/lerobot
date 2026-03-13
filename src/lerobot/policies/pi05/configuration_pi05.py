@@ -81,6 +81,16 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Goal image conditioning (Option A: goal image → embedding → task token)
+    # When enabled, a per-episode goal image is encoded and injected as an additional
+    # conditioning token into the prefix sequence, alongside language and observation tokens.
+    use_goal_image: bool = False
+    goal_image_key: str = "task.goal_image"  # Batch key for goal image (must start with "task." or "observation.")
+    goal_encoder_type: str = "clip"  # Encoder backend: "clip" (default) or "simple" (lightweight CNN)
+    goal_encoder_model_name: str = "openai/clip-vit-base-patch32"  # HuggingFace model name for CLIP
+    goal_projection_dim: int = 512  # Goal embedding dimension (CLIP ViT-B/32 default: 512)
+    finetune_goal_encoder: bool = False  # Whether to unfreeze and finetune the goal encoder
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -114,6 +124,17 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        # Validate goal image conditioning config
+        if self.use_goal_image:
+            if self.goal_encoder_type not in ["clip", "simple"]:
+                raise ValueError(
+                    f"Invalid goal_encoder_type: '{self.goal_encoder_type}'. Choose 'clip' or 'simple'."
+                )
+            if self.goal_projection_dim <= 0:
+                raise ValueError(
+                    f"goal_projection_dim must be positive, got {self.goal_projection_dim}"
+                )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

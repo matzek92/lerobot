@@ -58,6 +58,140 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+# CLIP image normalization constants (used in GoalImageEncoder with encoder_type="clip")
+_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+
+
+class SimpleCNNGoalEncoder(nn.Module):
+    """Lightweight CNN encoder used as a fallback when CLIP is unavailable.
+
+    Expects input images as float32 tensors in ``[0, 1]`` range with shape
+    ``[B, C, H, W]``.  Outputs a vector of shape ``[B, output_dim]``.
+    """
+
+    def __init__(self, output_dim: int = 256):
+        super().__init__()
+        self.output_dim = output_dim
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, output_dim),
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Normalize [0, 1] → [-1, 1] before conv layers
+        return self.net(images * 2.0 - 1.0)
+
+
+class GoalImageEncoder(nn.Module):
+    """Encodes a goal image into a fixed-size embedding for conditioning pi0.5.
+
+    Supports two encoder backends:
+
+    * ``"clip"`` *(default)*: CLIP vision encoder
+      (``CLIPVisionModelWithProjection`` from *transformers*).  Weights are
+      downloaded via the standard HuggingFace cache mechanism.
+    * ``"simple"``: A lightweight four-layer CNN that does not require any
+      additional downloads and runs entirely on CPU.
+
+    The encoder output is optionally projected to ``output_dim`` via a linear
+    layer so that the embedding size is stable regardless of the chosen backend.
+
+    Args:
+        encoder_type: ``"clip"`` or ``"simple"``.
+        model_name: HuggingFace model name / path used when ``encoder_type="clip"``.
+        output_dim: Desired embedding dimension after the optional projection.
+        finetune: If ``False`` (default) the encoder weights are frozen; only
+            the downstream projection layer is trained.
+    """
+
+    def __init__(
+        self,
+        encoder_type: str = "clip",
+        model_name: str = "openai/clip-vit-base-patch32",
+        output_dim: int = 512,
+        finetune: bool = False,
+    ):
+        super().__init__()
+        self.encoder_type = encoder_type
+        self.output_dim = output_dim
+
+        if encoder_type == "clip":
+            if not _transformers_available:
+                raise ImportError(
+                    "The 'transformers' package is required for the CLIP goal image encoder. "
+                    "Install it with: pip install transformers, or set goal_encoder_type='simple'."
+                )
+            from transformers import CLIPVisionModelWithProjection
+
+            self.encoder = CLIPVisionModelWithProjection.from_pretrained(model_name)
+            encoder_raw_dim: int = self.encoder.config.projection_dim  # 512 for ViT-B/32
+            # Register CLIP normalization constants as non-persistent buffers so that
+            # they are automatically moved to the correct device with the model.
+            self.register_buffer(
+                "clip_mean",
+                torch.tensor(_CLIP_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "clip_std",
+                torch.tensor(_CLIP_STD, dtype=torch.float32).view(1, 3, 1, 1),
+                persistent=False,
+            )
+        elif encoder_type == "simple":
+            self.encoder = SimpleCNNGoalEncoder(output_dim=output_dim)
+            encoder_raw_dim = output_dim
+        else:
+            raise ValueError(
+                f"Unknown goal_encoder_type: '{encoder_type}'. Valid options are 'clip' and 'simple'."
+            )
+
+        # Optional linear projection to standardise the embedding dimension.
+        if encoder_raw_dim != output_dim and encoder_type == "clip":
+            self.proj: nn.Linear | None = nn.Linear(encoder_raw_dim, output_dim)
+        else:
+            self.proj = None
+
+        # Freeze encoder weights unless fine-tuning is explicitly requested.
+        if not finetune:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode goal images into fixed-size embeddings.
+
+        Args:
+            images: Float32 tensor of shape ``[B, C, H, W]`` with values in
+                ``[0, 1]`` (standard LeRobot image convention).
+
+        Returns:
+            Tensor of shape ``[B, output_dim]``.
+        """
+        # Resize to 224×224 if necessary (both CLIP and SimpleCNN expect this)
+        if images.shape[-2:] != (224, 224):
+            images = F.interpolate(images.float(), size=(224, 224), mode="bilinear", align_corners=False)
+
+        if self.encoder_type == "clip":
+            # Apply CLIP-specific normalization
+            images = (images.float() - self.clip_mean) / self.clip_std
+            outputs = self.encoder(pixel_values=images)
+            embeddings = outputs.image_embeds  # [B, projection_dim]
+        else:
+            embeddings = self.encoder(images.float())  # [B, output_dim]
+
+        if self.proj is not None:
+            embeddings = self.proj(embeddings)
+
+        return embeddings  # [B, output_dim]
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -563,6 +697,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Goal image conditioning components (optional)
+        # When enabled: goal image → GoalImageEncoder → goal_proj → single prefix token
+        if config.use_goal_image:
+            self.goal_encoder = GoalImageEncoder(
+                encoder_type=config.goal_encoder_type,
+                model_name=config.goal_encoder_model_name,
+                output_dim=config.goal_projection_dim,
+                finetune=config.finetune_goal_encoder,
+            )
+            # Project from goal embedding dim to the PaliGemma language model hidden size
+            self.goal_proj = nn.Linear(config.goal_projection_dim, paligemma_config.width)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -632,9 +778,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self, images, img_masks, tokens, masks, goal_emb: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed images with SigLIP and language tokens with embedding layer.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            tokens: Language token tensor.
+            masks: Language attention mask tensor.
+            goal_emb: Optional goal image embedding of shape ``[B, goal_projection_dim]``.
+                When provided (i.e. ``use_goal_image=True``), it is projected to the
+                PaliGemma hidden size and appended as an additional prefix token.
+
+        Returns:
+            Tuple of ``(embs, pad_masks, att_masks)``.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -664,6 +823,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        # Inject goal image conditioning token (appended after language tokens)
+        if goal_emb is not None:
+            # Cast to the same dtype as the language embedding before projection
+            goal_emb_cast = goal_emb.to(dtype=lang_emb.dtype, device=lang_emb.device)
+            # [B, goal_projection_dim] → [B, paligemma_width] → [B, 1, paligemma_width]
+            goal_token = self.goal_proj(goal_emb_cast).unsqueeze(1)
+            bsize_g = goal_token.shape[0]
+            embs.append(goal_token)
+            pad_masks.append(torch.ones(bsize_g, 1, dtype=torch.bool, device=goal_token.device))
+            att_masks += [0]  # Goal token is part of the prefix; attends to all prefix tokens
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -721,8 +891,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, goal_emb=None) -> Tensor:
+        """Do a full training forward pass and compute the loss.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            tokens: Language token tensor.
+            masks: Language attention mask tensor.
+            actions: Target action tensor.
+            noise: Optional noise tensor for flow matching.
+            time: Optional time tensor for flow matching.
+            goal_emb: Optional goal image embedding ``[B, goal_projection_dim]`` for conditioning.
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -733,7 +914,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, goal_emb=goal_emb
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -785,9 +968,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
+        goal_emb=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """Do a full inference forward and compute the action.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            tokens: Language token tensor.
+            masks: Language attention mask tensor.
+            noise: Optional initial noise tensor.
+            num_steps: Number of denoising steps (defaults to ``config.num_inference_steps``).
+            goal_emb: Optional goal image embedding ``[B, goal_projection_dim]`` for conditioning.
+            **kwargs: Additional keyword arguments (RTC-related).
+        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -803,7 +998,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, goal_emb=goal_emb
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1194,6 +1391,53 @@ class PI05Policy(PreTrainedPolicy):
 
         return images, img_masks
 
+    def _encode_goal_image(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode the goal image from the batch into a conditioning embedding.
+
+        Args:
+            batch: Batch dictionary expected to contain ``self.config.goal_image_key``.
+
+        Returns:
+            Goal image embedding tensor of shape ``[B, goal_projection_dim]``.
+
+        Raises:
+            ValueError: If the goal image key is not present in ``batch``.
+        """
+        goal_key = self.config.goal_image_key
+        if goal_key not in batch:
+            raise ValueError(
+                f"Goal image key '{goal_key}' not found in batch. "
+                f"Available keys: {sorted(str(k) for k in batch.keys())}. "
+                "Ensure the dataset provides goal images under this key, or disable goal "
+                "conditioning by setting use_goal_image=False in the policy config."
+            )
+
+        goal_img = batch[goal_key]
+        device = next(self.parameters()).device
+
+        if not isinstance(goal_img, Tensor):
+            raise TypeError(
+                f"Expected goal image to be a torch.Tensor, got {type(goal_img)}."
+            )
+
+        # Ensure tensor is on the correct device
+        if goal_img.device != device:
+            goal_img = goal_img.to(device)
+
+        # Ensure float32 dtype
+        if goal_img.dtype != torch.float32:
+            goal_img = goal_img.to(torch.float32)
+
+        # Scale from [0, 255] to [0, 1] if necessary (uint8 images from dataloader)
+        if goal_img.max() > 1.5:
+            goal_img = goal_img / 255.0
+
+        # Add batch dimension if single image is provided (inference case)
+        if goal_img.dim() == 3:  # [C, H, W]
+            goal_img = goal_img.unsqueeze(0)  # → [1, C, H, W]
+
+        return self.model.goal_encoder(goal_img)
+
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
@@ -1225,8 +1469,11 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Optionally encode goal image for conditioning
+        goal_emb = self._encode_goal_image(batch) if self.config.use_goal_image else None
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, goal_emb=goal_emb, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1249,8 +1496,11 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
 
+        # Optionally encode goal image for conditioning
+        goal_emb = self._encode_goal_image(batch) if self.config.use_goal_image else None
+
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(images, img_masks, tokens, masks, actions, goal_emb=goal_emb)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
