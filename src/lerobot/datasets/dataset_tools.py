@@ -329,9 +329,9 @@ def trim_episodes(
             # Required task string.
             frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
 
-            # Video features: CHW float32 [0, 1] numpy array.
+            # Video features: HWC float32 [0, 1] numpy array.
             for vid_key in dataset.meta.video_keys:
-                frame[vid_key] = video_frames[vid_key][i]
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
 
             # Image and numerical features.
             for key, feat in user_features.items():
@@ -480,7 +480,7 @@ def split_episodes(
                 frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
 
                 for vid_key in dataset.meta.video_keys:
-                    frame[vid_key] = video_frames[vid_key][i]
+                    frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
 
                 for key, feat in user_features.items():
                     if feat["dtype"] == "video":
@@ -2175,6 +2175,8 @@ def _encode_guide_video(
     from fractions import Fraction
 
     import av
+    import cv2
+    import PIL.Image
 
     vcodec = resolve_vcodec(vcodec)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2191,33 +2193,14 @@ def _encode_guide_video(
         for ep_idx in episodes:
             ep = src_dataset.meta.episodes[ep_idx]
             ep_length = ep["length"]
-            src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
 
-            # Locate and open source video file for this episode
-            src_video_rel_path = src_dataset.meta.get_video_file_path(ep_idx, source_key)
-            src_video_path = src_dataset.root / src_video_rel_path
-
-            # Decode the first frame of this episode
-            first_frame_image = None
-            with av.open(str(src_video_path)) as in_container:
-                in_stream = in_container.streams.video[0]
-                # Seek to episode start (in microseconds, the global AV time base)
-                seek_us = int(src_from_ts * 1_000_000)
-                in_container.seek(seek_us, backward=True, stream=in_stream)
-
-                for packet in in_container.demux(in_stream):
-                    for frame in packet.decode():
-                        if frame is not None:
-                            first_frame_image = frame.to_image().convert("RGB")
-                            break
-                    if first_frame_image is not None:
-                        break
-
-            if first_frame_image is None:
-                raise ValueError(
-                    f"Could not decode first frame for episode {ep_idx}, "
-                    f"source key '{source_key}'"
-                )
+            # Decode the first frame of this episode using the dataset's
+            # own video pipeline (torchcodec/torchvision) for correct
+            # frame resolution.
+            first_frame_bgr = _decode_first_frame_bgr(src_dataset, ep_idx, source_key)
+            first_frame_image = PIL.Image.fromarray(
+                cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2RGB)
+            )
 
             # Initialize output stream from first decoded frame
             if out_stream is None:
@@ -2301,6 +2284,8 @@ def add_guide_stream(
     pix_fmt: str = "yuv420p",
     g: int = 2,
     crf: int = 30,
+    episode_indices: list[int] | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
 ) -> LeRobotDataset:
     """Add a guide video stream to a LeRobotDataset.
 
@@ -2309,9 +2294,14 @@ def add_guide_stream(
     relevant object is at the start of the episode — useful for downstream
     policies or visualisation.
 
-    The new video files follow the same chunk/file layout as ``source_key``:
-    episodes that share a source video file are grouped into the same guide
-    video file.
+    Uses the ``add_frame`` / ``save_episode`` / ``finalize`` pattern so that
+    the v3 format's multi-episode video/parquet containers are managed
+    automatically by the framework.
+
+    When *episode_indices* is given, only those episodes are processed.  When
+    *append_to_dataset* is provided, the processed episodes are **appended** to
+    that existing dataset instead of creating a new one, enabling an incremental
+    workflow where multiple runs accumulate results.
 
     Args:
         dataset: The source LeRobotDataset (must contain at least one video key).
@@ -2319,17 +2309,20 @@ def add_guide_stream(
             guide (e.g. ``"observation.images.laptop"``).
         new_key: Name for the new guide video stream
             (e.g. ``"observation.images.guide_laptop"``).
-        output_dir: Directory for the new dataset.  If ``None``, defaults to
-            ``HF_LEROBOT_HOME / repo_id``.
-        repo_id: Repository ID for the new dataset.  If ``None``, ``"_with_guide"``
-            is appended to the original repo ID.
-        vcodec: Video codec for the guide stream (default: ``"libsvtav1"``).
-        pix_fmt: Pixel format for the guide stream (default: ``"yuv420p"``).
-        g: GOP size for encoding (default: ``2``).
-        crf: Constant rate factor / quality setting (default: ``30``).
+        output_dir: Directory for the new dataset.  Ignored when *append_to_dataset*
+            is given.  If ``None``, defaults to ``HF_LEROBOT_HOME / repo_id``.
+        repo_id: Repository ID for the new dataset.  Ignored when *append_to_dataset*
+            is given.  If ``None``, ``"_with_guide"`` is appended to the original repo ID.
+        vcodec: Video codec for encoding (default: ``"libsvtav1"``).
+        pix_fmt: Pixel format (kept for backward compat; framework default used).
+        g: GOP size (kept for backward compat).
+        crf: Constant rate factor (kept for backward compat).
+        episode_indices: List of episode indices to process.  ``None`` means all.
+        append_to_dataset: When provided, episodes are appended to this existing
+            dataset.  *output_dir* and *repo_id* must be ``None``.
 
     Returns:
-        New :class:`LeRobotDataset` with the guide stream added.
+        :class:`LeRobotDataset` — the newly created or updated target dataset.
 
     Example::
 
@@ -2338,6 +2331,7 @@ def add_guide_stream(
             dataset,
             source_key="observation.images.laptop",
             new_key="observation.images.guide_laptop",
+            episode_indices=[0, 1, 2],
         )
     """
     if source_key not in dataset.meta.video_keys:
@@ -2348,131 +2342,126 @@ def add_guide_stream(
             "convert_image_to_video_dataset()."
         )
 
-    if new_key in dataset.meta.features:
-        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'."
+        )
 
     if dataset.meta.episodes is None:
         dataset.meta.episodes = load_episodes(dataset.root)
 
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_with_guide"
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+    if episode_indices is None:
+        episode_indices = list(range(dataset.meta.total_episodes))
 
-    # Build new features dict: copy source feature spec (shape/dtype) for the guide
+    valid_indices = set(range(dataset.meta.total_episodes))
+    invalid = set(episode_indices) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
+
+    # Feature dict without the default system features (re-added by create()).
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
     source_feature = {
         "dtype": "video",
         "shape": dataset.meta.features[source_key]["shape"],
         "names": dataset.meta.features[source_key].get("names"),
     }
-    new_features = dataset.meta.features.copy()
-    new_features[new_key] = source_feature
 
-    # Create destination metadata
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=new_features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=True,
-        chunks_size=dataset.meta.chunks_size,
-        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
-        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
-    )
-
-    # Copy parquet data files (no column changes needed for a video-only addition)
-    logging.info("Copying data files…")
-    data_dir_src = dataset.root / DATA_DIR
-    data_dir_dst = new_meta.root / DATA_DIR
-    shutil.copytree(data_dir_src, data_dir_dst)
-
-    # Copy existing video files
-    logging.info("Copying existing video files…")
-    _copy_videos(dataset, new_meta)
-
-    # Copy episodes metadata (will be extended with guide-stream columns below)
-    logging.info("Copying episodes metadata…")
-    episodes_src = dataset.root / "meta" / "episodes"
-    episodes_dst = new_meta.root / "meta" / "episodes"
-    if episodes_src.exists():
-        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
-
-    # Copy tasks and stats
-    if dataset.meta.tasks is not None:
-        write_tasks(dataset.meta.tasks, new_meta.root)
-    if dataset.meta.stats is not None:
-        write_stats(dataset.meta.stats, new_meta.root)
-
-    # Group episodes by their source video file (same chunk/file layout)
-    file_to_episodes: dict[tuple[int, int], list[int]] = {}
-    for ep_idx in range(dataset.meta.total_episodes):
-        ep = dataset.meta.episodes[ep_idx]
-        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
-        file_idx = ep[f"videos/{source_key}/file_index"]
-        file_key = (chunk_idx, file_idx)
-        file_to_episodes.setdefault(file_key, []).append(ep_idx)
-
-    # Encode guide stream videos and collect per-episode metadata
-    fps = dataset.meta.fps
-    guide_video_metadata: dict[int, dict] = {}
-
-    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
-        sorted(file_to_episodes.items()), desc="Encoding guide stream videos"
-    ):
-        assert new_meta.video_path is not None
-        out_video_path = new_meta.root / new_meta.video_path.format(
-            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-        )
-
-        episode_timestamps = _encode_guide_video(
-            src_dataset=dataset,
-            source_key=source_key,
-            episodes=eps_in_file,
-            output_path=out_video_path,
-            fps=fps,
-            vcodec=vcodec,
-            pix_fmt=pix_fmt,
-            g=g,
-            crf=crf,
-        )
-
-        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
-            guide_video_metadata[ep_idx] = {
-                f"videos/{new_key}/chunk_index": src_chunk_idx,
-                f"videos/{new_key}/file_index": src_file_idx,
-                f"videos/{new_key}/from_timestamp": from_ts,
-                f"videos/{new_key}/to_timestamp": to_ts,
-            }
-
-    # Extend episodes metadata parquet files with the new video columns
-    logging.info("Updating episodes metadata with guide stream info…")
-    _update_episodes_metadata_with_video(new_meta, guide_video_metadata)
-
-    # Populate video codec/resolution info for the new key
-    first_guide_path = new_meta.root / new_meta.video_path.format(
-        video_key=new_key, chunk_index=0, file_index=0
-    )
-    if first_guide_path.exists():
-        new_meta.info["features"][new_key]["info"] = get_video_info(first_guide_path)
-
-    # Propagate existing video feature info (codec metadata) from source dataset
-    for key in dataset.meta.video_keys:
-        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
-            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
-
-    # Update dataset-level counters
-    new_meta.info.update(
-        {
-            "total_episodes": dataset.meta.total_episodes,
-            "total_frames": dataset.meta.total_frames,
-            "total_tasks": dataset.meta.total_tasks,
-            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+    if append_to_dataset is not None:
+        target_user_features = {
+            k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
         }
-    )
-    write_info(new_meta.info, new_meta.root)
+        expected = {**user_features, new_key: source_feature}
+        if set(expected.keys()) != set(target_user_features.keys()):
+            raise ValueError(
+                f"Feature mismatch between source+new_key and append target. "
+                f"Expected: {set(expected.keys())}, Target has: {set(target_user_features.keys())}"
+            )
+        if dataset.meta.fps != append_to_dataset.meta.fps:
+            raise ValueError(
+                f"FPS mismatch: source={dataset.meta.fps}, target={append_to_dataset.meta.fps}"
+            )
+        if append_to_dataset.latest_episode is not None:
+            append_to_dataset._writer_closed_for_reading = True
+        append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+        write_target = append_to_dataset
+    else:
+        if new_key in dataset.meta.features:
+            raise ValueError(f"Key '{new_key}' already exists in dataset features.")
 
-    logging.info(f"Guide stream '{new_key}' added. Dataset saved to: {output_dir}")
-    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+        if repo_id is None:
+            repo_id = f"{dataset.repo_id}_with_guide"
+        output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+        write_target = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=dataset.meta.fps,
+            features={**user_features, new_key: source_feature},
+            robot_type=dataset.meta.robot_type,
+            root=output_dir,
+            use_videos=True,
+            vcodec=vcodec,
+        )
+
+    dataset._ensure_hf_dataset_loaded()
+
+    for ep_idx in tqdm(episode_indices, desc="Adding guide stream"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        # Batch-decode all source video frames for this episode.
+        video_frames: dict[str, np.ndarray] = {}
+        for vid_key in dataset.meta.video_keys:
+            from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+            timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+            frames_tensor = decode_video_frames(
+                video_path, timestamps, dataset.tolerance_s, dataset.video_backend
+            )
+            video_frames[vid_key] = frames_tensor.numpy()  # (N, C, H, W) float32
+
+        # Guide frame: first frame of source_key, repeated for all frames.
+        guide_frame_hwc = video_frames[source_key][0].transpose(1, 2, 0)  # (H, W, C) float32 [0, 1]
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            # Source video features (HWC float32)
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
+
+            # New guide stream (same first frame repeated)
+            frame[new_key] = guide_frame_hwc
+
+            # Image and numerical features
+            for key, feat in user_features.items():
+                if feat["dtype"] == "video":
+                    continue
+                elif feat["dtype"] == "image":
+                    frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[key] = item[key].numpy()
+
+            write_target.add_frame(frame)
+
+        write_target.save_episode()
+
+    write_target.finalize()
+    write_target._ensure_hf_dataset_loaded()
+
+    action = "Appended guide stream episodes to" if append_to_dataset is not None else "Created"
+    logging.info(
+        f"{action} dataset with guide stream '{new_key}': "
+        f"{write_target.meta.total_episodes} episodes, "
+        f"{write_target.meta.total_frames} frames"
+    )
+    return write_target
 
 
 # ---------------------------------------------------------------------------
@@ -2486,6 +2475,11 @@ def _decode_first_frame_bgr(
 ) -> np.ndarray:
     """Decode the first frame of an episode's video stream and return it as BGR numpy array.
 
+    Uses the dataset's own video decoding pipeline (``__getitem__`` →
+    ``_query_videos`` → ``decode_video_frames``) which correctly resolves
+    frames via torchcodec/torchvision, avoiding manual PyAV timestamp
+    precision issues.
+
     Args:
         dataset: Source dataset.
         episode_idx: Episode index.
@@ -2494,35 +2488,15 @@ def _decode_first_frame_bgr(
     Returns:
         BGR image as numpy array (H, W, 3), dtype uint8.
     """
-    import av
     import cv2
 
     ep = dataset.meta.episodes[episode_idx]
-    src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
-    src_video_rel_path = dataset.meta.get_video_file_path(episode_idx, source_key)
-    src_video_path = dataset.root / src_video_rel_path
-
-    first_frame_image = None
-    with av.open(str(src_video_path)) as container:
-        stream = container.streams.video[0]
-        seek_us = int(src_from_ts * 1_000_000)
-        container.seek(seek_us, backward=True, stream=stream)
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                if frame is not None:
-                    first_frame_image = frame.to_image().convert("RGB")
-                    break
-            if first_frame_image is not None:
-                break
-
-    if first_frame_image is None:
-        raise ValueError(
-            f"Could not decode first frame for episode {episode_idx}, "
-            f"source key '{source_key}'"
-        )
-
-    frame_rgb = np.array(first_frame_image)
-    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    first_idx = ep["dataset_from_index"]
+    item = dataset[first_idx]
+    # item[source_key] is a (C, H, W) float32 tensor in [0, 1]
+    chw = item[source_key]
+    rgb = (chw * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -2617,10 +2591,10 @@ def _encode_precomputed_guide_video(
 
 
 # ---------------------------------------------------------------------------
-# Public API: add_initial_scene_segmentation_stream
+# Public API: add_sam2_initial_segment
 # ---------------------------------------------------------------------------
 
-def add_initial_scene_segmentation_stream(
+def add_sam2_initial_segment(
     dataset: LeRobotDataset,
     source_key: str,
     new_key: str,
@@ -2632,42 +2606,46 @@ def add_initial_scene_segmentation_stream(
     crf: int = 30,
     fade_pixels: int = 16,
     min_brightness: float = 0.0,
+    episode_indices: list[int] | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
 ) -> LeRobotDataset:
     """Add a segmented scene stream by interactively segmenting the first frame of each episode.
 
-    For every episode the first frame of ``source_key`` is shown in an
+    For every selected episode the first frame of ``source_key`` is shown in an
     interactive OpenCV window.  The user selects an object using SAM2
     point-prompt segmentation (left click = foreground, right click =
-    background, Enter = confirm).  The resulting highlighted image —
-    with the selected object in full colour and a gradient fade-to-black
-    around it — is then repeated for the full duration of that episode,
-    exactly like :func:`add_guide_stream`.
+    background, Enter = confirm).  The resulting highlighted image is then
+    repeated for the full duration of that episode.
 
-    If the user cancels segmentation for an episode (presses Escape),
-    the raw first frame is used instead (no highlighting).
+    Uses the ``add_frame`` / ``save_episode`` / ``finalize`` pattern so that
+    the v3 format containers are managed automatically by the framework.
+
+    When *episode_indices* is given, only those episodes are processed.  When
+    *append_to_dataset* is provided, the processed episodes are **appended** to
+    that existing dataset instead of creating a new one.
 
     Args:
         dataset: Source LeRobotDataset (must contain at least one video key).
-        source_key: Existing video key whose first frame is segmented
-            (e.g. ``"observation.images.laptop"``).
-        new_key: Name for the new segmented stream
-            (e.g. ``"observation.images.segmented_laptop"``).
-        output_dir: Directory for the new dataset.  Defaults to
-            ``HF_LEROBOT_HOME / repo_id``.
-        repo_id: Repository ID for the new dataset.  Defaults to
-            ``"<original>_with_seg"``.
+        source_key: Existing video key whose first frame is segmented.
+        new_key: Name for the new segmented stream.
+        output_dir: Directory for the new dataset.  Ignored when *append_to_dataset*
+            is given.
+        repo_id: Repository ID for the new dataset.  Ignored when *append_to_dataset*
+            is given.
         vcodec: Video codec (default: ``"libsvtav1"``).
-        pix_fmt: Pixel format (default: ``"yuv420p"``).
-        g: GOP size (default: ``2``).
-        crf: Constant rate factor (default: ``30``).
-        fade_pixels: Number of pixels over which brightness fades from full
-            (at the mask edge) to *min_brightness* (default: ``80``).
-        min_brightness: Brightness multiplier beyond the fade zone
-            (``0.0`` = black, ``1.0`` = unchanged; default: ``0.0``).
+        pix_fmt: Pixel format (kept for backward compat).
+        g: GOP size (kept for backward compat).
+        crf: Constant rate factor (kept for backward compat).
+        fade_pixels: Pixels over which brightness fades from full to *min_brightness*.
+        min_brightness: Background brightness (0.0 = black, 1.0 = unchanged).
+        episode_indices: List of episode indices to process.  ``None`` means all.
+        append_to_dataset: When provided, episodes are appended to this existing dataset.
 
     Returns:
-        New :class:`LeRobotDataset` with the segmented stream added.
+        :class:`LeRobotDataset` with the segmented stream added.
     """
+    import cv2
+
     from lerobot.cameras.zmq.segment import SAM2Segmenter, interactive_select
 
     if source_key not in dataset.meta.video_keys:
@@ -2676,32 +2654,33 @@ def add_initial_scene_segmentation_stream(
             f"Video keys in dataset: {dataset.meta.video_keys}."
         )
 
-    if new_key in dataset.meta.features:
-        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'."
+        )
 
     if dataset.meta.episodes is None:
         dataset.meta.episodes = load_episodes(dataset.root)
 
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_with_seg"
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+    if episode_indices is None:
+        episode_indices = list(range(dataset.meta.total_episodes))
+
+    valid_indices = set(range(dataset.meta.total_episodes))
+    invalid = set(episode_indices) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
 
     # -- Phase 1: interactive segmentation of the first frame per episode ----
     logging.info("Loading SAM2 segmenter …")
     segmenter = SAM2Segmenter()
 
-    precomputed_frames: dict[int, np.ndarray] = {}
-    episode_lengths: dict[int, int] = {}
-    total_episodes = dataset.meta.total_episodes
+    precomputed_frames_bgr: dict[int, np.ndarray] = {}
 
-    for ep_idx in range(total_episodes):
-        ep = dataset.meta.episodes[ep_idx]
-        episode_lengths[ep_idx] = ep["length"]
-
+    for ep_idx in episode_indices:
         first_frame_bgr = _decode_first_frame_bgr(dataset, ep_idx, source_key)
 
         logging.info(
-            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Episode {ep_idx}: "
             "Select object to segment (Enter=confirm, Esc=skip)"
         )
         highlighted, mask = interactive_select(
@@ -2713,123 +2692,115 @@ def add_initial_scene_segmentation_stream(
         )
 
         if highlighted is not None:
-            precomputed_frames[ep_idx] = highlighted
+            precomputed_frames_bgr[ep_idx] = highlighted
         else:
-            # User cancelled – fall back to the raw first frame
             logging.info(f"Episode {ep_idx}: segmentation skipped, using raw frame.")
-            precomputed_frames[ep_idx] = first_frame_bgr
+            precomputed_frames_bgr[ep_idx] = first_frame_bgr
 
-    # -- Phase 2: build new dataset (same structure as add_guide_stream) -----
+    # -- Phase 2: write episodes via add_frame pattern ----------------------
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
     source_feature = {
         "dtype": "video",
         "shape": dataset.meta.features[source_key]["shape"],
         "names": dataset.meta.features[source_key].get("names"),
     }
-    new_features = dataset.meta.features.copy()
-    new_features[new_key] = source_feature
 
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=new_features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=True,
-        chunks_size=dataset.meta.chunks_size,
-        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
-        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
-    )
-
-    # Copy parquet data files
-    logging.info("Copying data files …")
-    data_dir_src = dataset.root / DATA_DIR
-    data_dir_dst = new_meta.root / DATA_DIR
-    shutil.copytree(data_dir_src, data_dir_dst)
-
-    # Copy existing video files
-    logging.info("Copying existing video files …")
-    _copy_videos(dataset, new_meta)
-
-    # Copy episodes metadata
-    logging.info("Copying episodes metadata …")
-    episodes_src = dataset.root / "meta" / "episodes"
-    episodes_dst = new_meta.root / "meta" / "episodes"
-    if episodes_src.exists():
-        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
-
-    # Copy tasks and stats
-    if dataset.meta.tasks is not None:
-        write_tasks(dataset.meta.tasks, new_meta.root)
-    if dataset.meta.stats is not None:
-        write_stats(dataset.meta.stats, new_meta.root)
-
-    # Group episodes by source video file (same chunk/file layout)
-    file_to_episodes: dict[tuple[int, int], list[int]] = {}
-    for ep_idx in range(total_episodes):
-        ep = dataset.meta.episodes[ep_idx]
-        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
-        file_idx = ep[f"videos/{source_key}/file_index"]
-        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
-
-    # -- Phase 3: encode segmented stream videos -----------------------------
-    fps = dataset.meta.fps
-    seg_video_metadata: dict[int, dict] = {}
-
-    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
-        sorted(file_to_episodes.items()), desc="Encoding segmented stream videos"
-    ):
-        assert new_meta.video_path is not None
-        out_video_path = new_meta.root / new_meta.video_path.format(
-            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-        )
-
-        episode_timestamps = _encode_precomputed_guide_video(
-            precomputed_frames=precomputed_frames,
-            episode_lengths=episode_lengths,
-            episodes=eps_in_file,
-            output_path=out_video_path,
-            fps=fps,
-            vcodec=vcodec,
-            pix_fmt=pix_fmt,
-            g=g,
-            crf=crf,
-        )
-
-        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
-            seg_video_metadata[ep_idx] = {
-                f"videos/{new_key}/chunk_index": src_chunk_idx,
-                f"videos/{new_key}/file_index": src_file_idx,
-                f"videos/{new_key}/from_timestamp": from_ts,
-                f"videos/{new_key}/to_timestamp": to_ts,
-            }
-
-    # Update episodes metadata with new video columns
-    logging.info("Updating episodes metadata with segmented stream info …")
-    _update_episodes_metadata_with_video(new_meta, seg_video_metadata)
-
-    # Populate video codec/resolution info
-    first_seg_path = new_meta.root / new_meta.video_path.format(
-        video_key=new_key, chunk_index=0, file_index=0
-    )
-    if first_seg_path.exists():
-        new_meta.info["features"][new_key]["info"] = get_video_info(first_seg_path)
-
-    for key in dataset.meta.video_keys:
-        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
-            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
-
-    new_meta.info.update(
-        {
-            "total_episodes": dataset.meta.total_episodes,
-            "total_frames": dataset.meta.total_frames,
-            "total_tasks": dataset.meta.total_tasks,
-            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+    if append_to_dataset is not None:
+        target_user_features = {
+            k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
         }
-    )
-    write_info(new_meta.info, new_meta.root)
+        expected = {**user_features, new_key: source_feature}
+        if set(expected.keys()) != set(target_user_features.keys()):
+            raise ValueError(
+                f"Feature mismatch between source+new_key and append target. "
+                f"Expected: {set(expected.keys())}, Target has: {set(target_user_features.keys())}"
+            )
+        if dataset.meta.fps != append_to_dataset.meta.fps:
+            raise ValueError(
+                f"FPS mismatch: source={dataset.meta.fps}, target={append_to_dataset.meta.fps}"
+            )
+        if append_to_dataset.latest_episode is not None:
+            append_to_dataset._writer_closed_for_reading = True
+        append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+        write_target = append_to_dataset
+    else:
+        if new_key in dataset.meta.features:
+            raise ValueError(f"Key '{new_key}' already exists in dataset features.")
 
-    logging.info(f"Segmented stream '{new_key}' added. Dataset saved to: {output_dir}")
-    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+        if repo_id is None:
+            repo_id = f"{dataset.repo_id}_with_seg"
+        output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+        write_target = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=dataset.meta.fps,
+            features={**user_features, new_key: source_feature},
+            robot_type=dataset.meta.robot_type,
+            root=output_dir,
+            use_videos=True,
+            vcodec=vcodec,
+        )
+
+    dataset._ensure_hf_dataset_loaded()
+
+    for ep_idx in tqdm(episode_indices, desc="Writing segmented stream"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        # Batch-decode all source video frames
+        video_frames: dict[str, np.ndarray] = {}
+        for vid_key in dataset.meta.video_keys:
+            from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+            timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+            frames_tensor = decode_video_frames(
+                video_path, timestamps, dataset.tolerance_s, dataset.video_backend
+            )
+            video_frames[vid_key] = frames_tensor.numpy()
+
+        # Convert segmented BGR frame to HWC float32 [0, 1]
+        bgr = precomputed_frames_bgr[ep_idx]
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        seg_frame_hwc = rgb.astype(np.float32) / 255.0
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
+
+            # Segmented stream (same highlighted frame repeated)
+            frame[new_key] = seg_frame_hwc
+
+            for key, feat in user_features.items():
+                if feat["dtype"] == "video":
+                    continue
+                elif feat["dtype"] == "image":
+                    frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[key] = item[key].numpy()
+
+            write_target.add_frame(frame)
+
+        write_target.save_episode()
+
+    write_target.finalize()
+    write_target._ensure_hf_dataset_loaded()
+
+    action = "Appended segmented episodes to" if append_to_dataset is not None else "Created"
+    logging.info(
+        f"{action} dataset with segmented stream '{new_key}': "
+        f"{write_target.meta.total_episodes} episodes, "
+        f"{write_target.meta.total_frames} frames"
+    )
+    return write_target
 
 
 # ---------------------------------------------------------------------------
@@ -2843,6 +2814,11 @@ def _decode_all_frames_bgr(
 ) -> list[np.ndarray]:
     """Decode every frame of an episode's video stream and return as BGR numpy arrays.
 
+    Uses the dataset's own video decoding pipeline (``__getitem__`` →
+    ``_query_videos`` → ``decode_video_frames``) which correctly resolves
+    frames via torchcodec/torchvision, avoiding manual PyAV timestamp
+    precision issues.
+
     Args:
         dataset: Source dataset.
         episode_idx: Episode index.
@@ -2851,41 +2827,21 @@ def _decode_all_frames_bgr(
     Returns:
         List of BGR images (H, W, 3), dtype uint8, one per frame.
     """
-    import av
     import cv2
 
     ep = dataset.meta.episodes[episode_idx]
-    src_from_ts = ep[f"videos/{source_key}/from_timestamp"]
-    src_to_ts = ep[f"videos/{source_key}/to_timestamp"]
+    first_idx = ep["dataset_from_index"]
     ep_length = ep["length"]
-    src_video_rel_path = dataset.meta.get_video_file_path(episode_idx, source_key)
-    src_video_path = dataset.root / src_video_rel_path
 
     frames: list[np.ndarray] = []
-    with av.open(str(src_video_path)) as container:
-        stream = container.streams.video[0]
-        seek_us = int(src_from_ts * 1_000_000)
-        container.seek(seek_us, backward=True, stream=stream)
+    for offset in range(ep_length):
+        item = dataset[first_idx + offset]
+        chw = item[source_key]
+        rgb = (chw * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        frames.append(bgr)
 
-        end_us = int(src_to_ts * 1_000_000)
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                if frame is None:
-                    continue
-                frame_us = int(frame.time * 1_000_000) if frame.time is not None else 0
-                if frame_us < seek_us:
-                    continue
-                if frame_us > end_us and len(frames) >= ep_length:
-                    break
-                rgb = np.array(frame.to_image().convert("RGB"))
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                frames.append(bgr)
-                if len(frames) >= ep_length:
-                    break
-            if len(frames) >= ep_length:
-                break
-
-    return frames[:ep_length]
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -2940,7 +2896,8 @@ def _encode_frame_list_video(
             bgr_frames = frames_per_episode[ep_idx]
             ep_length = episode_lengths[ep_idx]
 
-            for i in range(min(len(bgr_frames), ep_length)):
+            num_frames_to_encode = min(len(bgr_frames), ep_length)
+            for i in range(num_frames_to_encode):
                 rgb = cv2.cvtColor(bgr_frames[i], cv2.COLOR_BGR2RGB)
                 from PIL import Image
                 pil_image = Image.fromarray(rgb)
@@ -2966,7 +2923,7 @@ def _encode_frame_list_video(
                 frame_count += 1
 
             from_ts = cumulative_ts
-            to_ts = cumulative_ts + ep_length / fps
+            to_ts = cumulative_ts + num_frames_to_encode / fps
             episode_timestamps.append((from_ts, to_ts))
             cumulative_ts = to_ts
 
@@ -2993,44 +2950,49 @@ def add_sam2_stream(
     crf: int = 30,
     fade_pixels: int = 16,
     min_brightness: float = 0.0,
+    episode_indices: list[int] | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
 ) -> LeRobotDataset:
     """Add a SAM2 video-tracked segmentation stream to the dataset.
 
-    For every episode:
+    For every selected episode:
 
     1. The first frame of ``source_key`` is shown in an interactive OpenCV
        window where the user selects an object using SAM2 point prompts.
-    2. The SAM2 **video predictor** propagates the mask across all frames
-       of the episode.
+    2. The SAM2 **video predictor** propagates the mask across all frames.
     3. Each frame is highlighted (foreground preserved, background faded).
-    4. The resulting stream is previewed in **Rerun** so the user can
-       inspect the tracking quality.
+    4. The result is previewed in **Rerun** for quality inspection.
     5. The user confirms (``y``) or rejects (``n``) the result.
-       If rejected, the raw source frames are used for that episode.
-    6. The confirmed frames are encoded as a new video stream.
+    6. All frames (source + new stream) are written via ``add_frame``.
+
+    Uses the ``add_frame`` / ``save_episode`` / ``finalize`` pattern so that
+    the v3 format containers are managed automatically by the framework.
+
+    When *episode_indices* is given, only those episodes are processed.  When
+    *append_to_dataset* is provided, the processed episodes are **appended** to
+    that existing dataset instead of creating a new one.
 
     Args:
         dataset: Source LeRobotDataset (must contain at least one video key).
-        source_key: Existing video key to segment
-            (e.g. ``"observation.images.top_back"``).
-        new_key: Name for the new segmented stream
-            (e.g. ``"observation.images.sam2_top_back"``).
-        output_dir: Directory for the new dataset.
-        repo_id: Repository ID for the new dataset.
+        source_key: Existing video key to segment.
+        new_key: Name for the new segmented stream.
+        output_dir: Directory for the new dataset.  Ignored when *append_to_dataset*
+            is given.
+        repo_id: Repository ID for the new dataset.  Ignored when *append_to_dataset*
+            is given.
         vcodec: Video codec (default: ``"libsvtav1"``).
-        pix_fmt: Pixel format (default: ``"yuv420p"``).
-        g: GOP size (default: ``2``).
-        crf: Constant rate factor (default: ``30``).
+        pix_fmt: Pixel format (kept for backward compat).
+        g: GOP size (kept for backward compat).
+        crf: Constant rate factor (kept for backward compat).
         fade_pixels: Number of pixels for the fade-to-black gradient.
         min_brightness: Background brightness (0.0 = black).
+        episode_indices: List of episode indices to process.  ``None`` means all.
+        append_to_dataset: When provided, episodes are appended to this existing dataset.
 
     Returns:
-        New :class:`LeRobotDataset` with the SAM2-tracked stream added.
+        :class:`LeRobotDataset` with the SAM2-tracked stream added.
     """
-    import gc
-    import time
-
-    import rerun as rr
+    import cv2
 
     from lerobot.cameras.zmq.segment import (
         SAM2Segmenter,
@@ -3045,15 +3007,21 @@ def add_sam2_stream(
             f"Video keys in dataset: {dataset.meta.video_keys}."
         )
 
-    if new_key in dataset.meta.features:
-        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'."
+        )
 
     if dataset.meta.episodes is None:
         dataset.meta.episodes = load_episodes(dataset.root)
 
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_sam2"
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+    if episode_indices is None:
+        episode_indices = list(range(dataset.meta.total_episodes))
+
+    valid_indices = set(range(dataset.meta.total_episodes))
+    invalid = set(episode_indices) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
 
     # -- Load models --------------------------------------------------------
     logging.info("Loading SAM2 image segmenter (for interactive selection) …")
@@ -3061,18 +3029,16 @@ def add_sam2_stream(
     logging.info("Loading SAM2 video segmenter (for temporal propagation) …")
     video_segmenter = SAM2VideoSegmenter()
 
-    total_episodes = dataset.meta.total_episodes
     fps = dataset.meta.fps
-    processed_frames: dict[int, list[np.ndarray]] = {}
-    episode_lengths: dict[int, int] = {}
+    processed_frames: dict[int, list[np.ndarray]] = {}  # ep_idx → list of BGR
 
-    for ep_idx in range(total_episodes):
+    # -- Phase 1: interactive SAM2 processing per episode -------------------
+    for ep_idx in episode_indices:
         ep = dataset.meta.episodes[ep_idx]
         ep_length = ep["length"]
-        episode_lengths[ep_idx] = ep_length
 
         logging.info(
-            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Episode {ep_idx}: "
             f"Decoding {ep_length} frames from '{source_key}' …"
         )
         frames_bgr = _decode_all_frames_bgr(dataset, ep_idx, source_key)
@@ -3082,9 +3048,9 @@ def add_sam2_stream(
             processed_frames[ep_idx] = []
             continue
 
-        # -- Step 1: interactive selection on first frame -------------------
+        # Interactive selection on first frame
         logging.info(
-            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Episode {ep_idx}: "
             "Select object to track (Enter=confirm, Esc=skip)"
         )
         _highlighted, mask = interactive_select(
@@ -3100,38 +3066,30 @@ def add_sam2_stream(
             processed_frames[ep_idx] = frames_bgr
             continue
 
-        # Recover the points/labels from the interactive session
-        # We re-do image segmentation to extract the points that were used.
-        # However, interactive_select doesn't return points. So instead,
-        # we use the mask directly with the video predictor via add_new_mask.
-        # Let's propagate using the mask from frame 0.
+        # Propagate mask across all frames
         logging.info(
-            f"Episode {ep_idx + 1}/{total_episodes}: "
+            f"Episode {ep_idx}: "
             f"Propagating mask across {ep_length} frames with SAM2 video predictor …"
         )
         masks = _propagate_mask_across_frames(video_segmenter, frames_bgr, mask)
-        del mask  # free initial mask
+        del mask
 
-        # Apply highlighting to each frame (in-place to save memory)
+        # Apply highlighting
         highlighted_frames: list[np.ndarray] = []
         for i in range(len(frames_bgr)):
             highlighted = highlight_object_overlay(frames_bgr[i], masks[i])
             highlighted_frames.append(highlighted)
-            # Free source frame and mask immediately after use
             frames_bgr[i] = None  # type: ignore[assignment]
             masks[i] = None  # type: ignore[assignment]
 
-        # Re-decode source frames (lightweight) only for the Rerun preview
-        logging.info(
-            f"Episode {ep_idx + 1}/{total_episodes}: "
-            "Starting Rerun preview …"
-        )
+        # Rerun preview
+        logging.info(f"Episode {ep_idx}: Starting Rerun preview …")
         preview_source = _decode_all_frames_bgr(dataset, ep_idx, source_key)
         accepted = _preview_and_confirm_rerun(
             episode_idx=ep_idx,
             source_frames=preview_source,
             segmented_frames=highlighted_frames,
-            masks=[],  # masks already freed
+            masks=[],
             fps=fps,
             source_key=source_key,
             new_key=new_key,
@@ -3144,120 +3102,114 @@ def add_sam2_stream(
         else:
             logging.info(f"Episode {ep_idx}: rejected, using raw frames.")
             del highlighted_frames
-            processed_frames[ep_idx] = _decode_all_frames_bgr(
-                dataset, ep_idx, source_key
-            )
+            processed_frames[ep_idx] = _decode_all_frames_bgr(dataset, ep_idx, source_key)
 
-    # -- Build new dataset structure ----------------------------------------
+    # -- Phase 2: write episodes via add_frame pattern ----------------------
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
     source_feature = {
         "dtype": "video",
         "shape": dataset.meta.features[source_key]["shape"],
         "names": dataset.meta.features[source_key].get("names"),
     }
-    new_features = dataset.meta.features.copy()
-    new_features[new_key] = source_feature
 
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=new_features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=True,
-        chunks_size=dataset.meta.chunks_size,
-        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
-        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
-    )
-
-    # Copy parquet data files
-    logging.info("Copying data files …")
-    data_dir_src = dataset.root / DATA_DIR
-    data_dir_dst = new_meta.root / DATA_DIR
-    shutil.copytree(data_dir_src, data_dir_dst)
-
-    # Copy existing video files
-    logging.info("Copying existing video files …")
-    _copy_videos(dataset, new_meta)
-
-    # Copy episodes metadata
-    logging.info("Copying episodes metadata …")
-    episodes_src = dataset.root / "meta" / "episodes"
-    episodes_dst = new_meta.root / "meta" / "episodes"
-    if episodes_src.exists():
-        shutil.copytree(episodes_src, episodes_dst, dirs_exist_ok=True)
-
-    # Copy tasks and stats
-    if dataset.meta.tasks is not None:
-        write_tasks(dataset.meta.tasks, new_meta.root)
-    if dataset.meta.stats is not None:
-        write_stats(dataset.meta.stats, new_meta.root)
-
-    # Group episodes by source video file (same chunk/file layout)
-    file_to_episodes: dict[tuple[int, int], list[int]] = {}
-    for ep_idx in range(total_episodes):
-        ep = dataset.meta.episodes[ep_idx]
-        chunk_idx = ep[f"videos/{source_key}/chunk_index"]
-        file_idx = ep[f"videos/{source_key}/file_index"]
-        file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
-
-    # -- Encode SAM2-tracked stream videos ----------------------------------
-    sam2_video_metadata: dict[int, dict] = {}
-
-    for (src_chunk_idx, src_file_idx), eps_in_file in tqdm(
-        sorted(file_to_episodes.items()), desc="Encoding SAM2 stream videos"
-    ):
-        assert new_meta.video_path is not None
-        out_video_path = new_meta.root / new_meta.video_path.format(
-            video_key=new_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-        )
-
-        episode_timestamps = _encode_frame_list_video(
-            frames_per_episode=processed_frames,
-            episode_lengths=episode_lengths,
-            episodes=eps_in_file,
-            output_path=out_video_path,
-            fps=fps,
-            vcodec=vcodec,
-            pix_fmt=pix_fmt,
-            g=g,
-            crf=crf,
-        )
-
-        for ep_idx, (from_ts, to_ts) in zip(eps_in_file, episode_timestamps, strict=True):
-            sam2_video_metadata[ep_idx] = {
-                f"videos/{new_key}/chunk_index": src_chunk_idx,
-                f"videos/{new_key}/file_index": src_file_idx,
-                f"videos/{new_key}/from_timestamp": from_ts,
-                f"videos/{new_key}/to_timestamp": to_ts,
-            }
-
-    # Update episodes metadata with new video columns
-    logging.info("Updating episodes metadata with SAM2 stream info …")
-    _update_episodes_metadata_with_video(new_meta, sam2_video_metadata)
-
-    # Populate video codec/resolution info
-    first_sam2_path = new_meta.root / new_meta.video_path.format(
-        video_key=new_key, chunk_index=0, file_index=0
-    )
-    if first_sam2_path.exists():
-        new_meta.info["features"][new_key]["info"] = get_video_info(first_sam2_path)
-
-    for key in dataset.meta.video_keys:
-        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
-            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
-
-    new_meta.info.update(
-        {
-            "total_episodes": dataset.meta.total_episodes,
-            "total_frames": dataset.meta.total_frames,
-            "total_tasks": dataset.meta.total_tasks,
-            "splits": dataset.meta.info.get("splits", {"train": f"0:{dataset.meta.total_episodes}"}),
+    if append_to_dataset is not None:
+        target_user_features = {
+            k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
         }
-    )
-    write_info(new_meta.info, new_meta.root)
+        expected = {**user_features, new_key: source_feature}
+        if set(expected.keys()) != set(target_user_features.keys()):
+            raise ValueError(
+                f"Feature mismatch between source+new_key and append target. "
+                f"Expected: {set(expected.keys())}, Target has: {set(target_user_features.keys())}"
+            )
+        if dataset.meta.fps != append_to_dataset.meta.fps:
+            raise ValueError(
+                f"FPS mismatch: source={dataset.meta.fps}, target={append_to_dataset.meta.fps}"
+            )
+        if append_to_dataset.latest_episode is not None:
+            append_to_dataset._writer_closed_for_reading = True
+        append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+        write_target = append_to_dataset
+    else:
+        if new_key in dataset.meta.features:
+            raise ValueError(f"Key '{new_key}' already exists in dataset features.")
 
-    logging.info(f"SAM2 stream '{new_key}' added. Dataset saved to: {output_dir}")
-    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+        if repo_id is None:
+            repo_id = f"{dataset.repo_id}_sam2"
+        output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+        write_target = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=dataset.meta.fps,
+            features={**user_features, new_key: source_feature},
+            robot_type=dataset.meta.robot_type,
+            root=output_dir,
+            use_videos=True,
+            vcodec=vcodec,
+        )
+
+    dataset._ensure_hf_dataset_loaded()
+
+    for ep_idx in tqdm(episode_indices, desc="Writing SAM2 stream"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        # Batch-decode all source video frames
+        video_frames: dict[str, np.ndarray] = {}
+        for vid_key in dataset.meta.video_keys:
+            from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+            timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+            frames_tensor = decode_video_frames(
+                video_path, timestamps, dataset.tolerance_s, dataset.video_backend
+            )
+            video_frames[vid_key] = frames_tensor.numpy()
+
+        ep_processed = processed_frames[ep_idx]
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
+
+            # SAM2 tracked frame: convert BGR → HWC float32 [0, 1]
+            bgr = ep_processed[i]
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            frame[new_key] = rgb.astype(np.float32) / 255.0
+
+            for key, feat in user_features.items():
+                if feat["dtype"] == "video":
+                    continue
+                elif feat["dtype"] == "image":
+                    frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[key] = item[key].numpy()
+
+            write_target.add_frame(frame)
+
+        write_target.save_episode()
+
+        # Free processed frames for this episode
+        del processed_frames[ep_idx]
+
+    write_target.finalize()
+    write_target._ensure_hf_dataset_loaded()
+
+    action = "Appended SAM2 stream episodes to" if append_to_dataset is not None else "Created"
+    logging.info(
+        f"{action} dataset with SAM2 stream '{new_key}': "
+        f"{write_target.meta.total_episodes} episodes, "
+        f"{write_target.meta.total_frames} frames"
+    )
+    return write_target
 
 
 def _propagate_mask_across_frames(

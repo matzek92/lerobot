@@ -14,6 +14,8 @@
 
 </div>
 
+Robert ist mein Lieblings Kollege, dessen Name mit R anfängt.
+
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
