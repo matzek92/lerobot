@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from lerobot.datasets.dataset_tools import (
+    add_black_stream,
     add_features,
     add_guide_stream,
     delete_episodes,
@@ -1845,4 +1846,65 @@ def test_add_guide_stream_duplicate_key(video_dataset_for_guide, tmp_path):
             new_key=source_key,  # duplicate
             output_dir=tmp_path / "out_dup",
             repo_id="test/guide_dup",
+        )
+
+
+def test_add_black_stream(video_dataset_for_guide, tmp_path):
+    """Test adding an all-black stream to a video dataset."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+    black_dir = tmp_path / "black_ds"
+
+    black_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=black_dir,
+        repo_id="test/black_dataset",
+    )
+
+    # New dataset must contain the black stream as an additional video key
+    assert new_key in black_dataset.meta.video_keys
+    assert len(black_dataset.meta.video_keys) == len(video_dataset.meta.video_keys) + 1
+
+    # Episode and frame counts must be preserved
+    assert black_dataset.meta.total_episodes == video_dataset.meta.total_episodes
+    assert black_dataset.meta.total_frames == video_dataset.meta.total_frames
+
+    # A black video file must exist for every episode
+    for ep_idx in range(black_dataset.meta.total_episodes):
+        black_path = black_dataset.root / black_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert black_path.exists(), f"Black video file should exist: {black_path}"
+
+    # Feature shape must match the source camera
+    assert black_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+    # All original video keys are still present
+    for key in video_dataset.meta.video_keys:
+        assert key in black_dataset.meta.video_keys
+
+
+def test_add_black_stream_invalid_source_key(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError for a non-existent/non-video source key."""
+    with pytest.raises(ValueError, match="source_key"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key="nonexistent_key",
+            new_key="observation.images.black",
+            output_dir=tmp_path / "out_err",
+            repo_id="test/black_err",
+        )
+
+
+def test_add_black_stream_duplicate_key(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError when new_key already exists."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="already exists"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=source_key,  # duplicate
+            output_dir=tmp_path / "out_dup",
+            repo_id="test/black_dup",
         )
