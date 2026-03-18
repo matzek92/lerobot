@@ -72,21 +72,78 @@ class CNNBCPolicy(PreTrainedPolicy):
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+        # State history: each entry is a (state_dim,) tensor from a previous step.
+        state_dim = self.config.robot_state_feature.shape[0] if self.config.robot_state_feature else 0
+        if self.config.state_history_size > 0 and state_dim > 0:
+            self._state_history: deque[Tensor] = deque(
+                [torch.zeros(state_dim) for _ in range(self.config.state_history_size)],
+                maxlen=self.config.state_history_size,
+            )
+        else:
+            self._state_history = deque(maxlen=0)
+
+        # Action history: each entry is a (action_dim,) tensor (first action of a past chunk).
+        action_dim = self.config.action_feature.shape[0]
+        if self.config.action_history_size > 0:
+            self._action_history: deque[Tensor] = deque(
+                [torch.zeros(action_dim) for _ in range(self.config.action_history_size)],
+                maxlen=self.config.action_history_size,
+            )
+        else:
+            self._action_history = deque(maxlen=0)
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
         Manages an internal action queue: when the queue is empty the policy is queried for
         a full action chunk and the queue is populated from that chunk.
+
+        State history is updated at every call so that the most recent X states are available
+        the next time the model is queried.  Action history is updated each time a new chunk is
+        predicted (the first action of the chunk is stored).
         """
         self.eval()
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(self._build_batch_with_history(batch))[
+                :, : self.config.n_action_steps
+            ]
             # actions: (B, n_action_steps, action_dim) → enqueue as (n_action_steps, B, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
+            # Store the first action of this chunk in the action history (B=1 assumed at inference).
+            if self.config.action_history_size > 0:
+                self._action_history.append(actions[0, 0].detach())
+
+        # Record the current state so subsequent model queries can use it as context.
+        if self._state_history.maxlen and self.config.robot_state_feature is not None:
+            self._state_history.append(batch[OBS_STATE][0].detach())
+
         return self._action_queue.popleft()
+
+    def _build_batch_with_history(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Return a copy of *batch* enriched with flattened history tensors.
+
+        Keys added (when the corresponding history is configured and non-empty):
+            - ``"observation.state_history"``: ``(1, state_history_size * state_dim)``
+            - ``"observation.action_history"``: ``(1, action_history_size * action_dim)``
+        """
+        if not self._state_history and not self._action_history:
+            return batch  # nothing to add
+
+        batch = dict(batch)  # shallow copy – do not mutate the caller's dict
+        device = next(iter(batch.values())).device
+
+        if self._state_history:
+            state_hist = torch.stack(list(self._state_history)).to(device)  # (size, state_dim)
+            batch["observation.state_history"] = state_hist.flatten().unsqueeze(0)  # (1, size*state_dim)
+
+        if self._action_history:
+            action_hist = torch.stack(list(self._action_history)).to(device)  # (size, action_dim)
+            batch["observation.action_history"] = action_hist.flatten().unsqueeze(0)  # (1, size*action_dim)
+
+        return batch
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -120,8 +177,9 @@ class CNNBCNet(nn.Module):
     Architecture:
         1. For each camera image: ResNet18 backbone → global average pooling → flat feature vector.
         2. Concatenate all image feature vectors (and optional robot state).
-        3. Fully connected layers (Linear → ReLU → Dropout) to predict a flat action chunk.
-        4. Reshape output to (batch, chunk_size, action_dim).
+        3. Optionally append flattened state history and action history vectors.
+        4. Fully connected layers (Linear → ReLU → Dropout) to predict a flat action chunk.
+        5. Reshape output to (batch, chunk_size, action_dim).
     """
 
     def __init__(self, config: CNNBCConfig):
@@ -145,6 +203,14 @@ class CNNBCNet(nn.Module):
         input_dim = backbone_out_channels * num_cameras
         if config.robot_state_feature is not None:
             input_dim += config.robot_state_feature.shape[0]
+
+        # Add history dimensions.
+        state_dim = config.robot_state_feature.shape[0] if config.robot_state_feature else 0
+        if config.state_history_size > 0 and state_dim > 0:
+            input_dim += config.state_history_size * state_dim
+        action_dim = config.action_feature.shape[0]
+        if config.action_history_size > 0:
+            input_dim += config.action_history_size * action_dim
 
         # Build fully connected head.
         layers: list[nn.Module] = []
@@ -173,6 +239,10 @@ class CNNBCNet(nn.Module):
                 - ``"observation.images"`` (list of Tensor, each ``(B, C, H, W)``): camera images.
                 - ``"observation.state"`` (Tensor ``(B, state_dim)``): robot proprioceptive state
                   (optional, only if configured).
+                - ``"observation.state_history"`` (Tensor ``(B, state_history_size * state_dim)``):
+                  flattened past states (optional; zeros used when absent).
+                - ``"observation.action_history"`` (Tensor ``(B, action_history_size * action_dim)``):
+                  flattened past actions (optional; zeros used when absent).
 
         Returns:
             Tensor of shape ``(B, chunk_size, action_dim)`` with predicted action chunks.
@@ -188,6 +258,24 @@ class CNNBCNet(nn.Module):
 
         if self.config.robot_state_feature is not None:
             features.append(batch[OBS_STATE])
+
+        # History context — use zeros when not provided (e.g. during training).
+        if self.config.state_history_size > 0 and self.config.robot_state_feature is not None:
+            state_dim = self.config.robot_state_feature.shape[0]
+            hist_dim = self.config.state_history_size * state_dim
+            if "observation.state_history" in batch:
+                features.append(batch["observation.state_history"])
+            else:
+                ref = features[0]
+                features.append(torch.zeros(ref.shape[0], hist_dim, device=ref.device, dtype=ref.dtype))
+
+        if self.config.action_history_size > 0:
+            hist_dim = self.config.action_history_size * self._action_dim
+            if "observation.action_history" in batch:
+                features.append(batch["observation.action_history"])
+            else:
+                ref = features[0]
+                features.append(torch.zeros(ref.shape[0], hist_dim, device=ref.device, dtype=ref.dtype))
 
         x = torch.cat(features, dim=-1)  # (B, input_dim)
         x = self.fc(x)  # (B, chunk_size * action_dim)

@@ -52,6 +52,12 @@ class CNNBCConfig(PreTrainedConfig):
         hidden_dims: Sizes of the hidden layers in the fully connected head. Each element creates
             one Linear → ReLU → Dropout block.
         dropout: Dropout probability applied after each hidden layer in the FC head.
+        state_history_size: Number of past robot proprioceptive states to remember and feed to the
+            FC head alongside the current observation. Set to 0 to disable. Requires
+            ``robot_state_feature`` to be configured.
+        action_history_size: Number of past predicted actions to remember and feed to the FC head.
+            Each entry is the first action of a previously predicted chunk. Set to 0 to disable.
+            During training (where sequential context is unavailable) zeros are used as a substitute.
         optimizer_lr: Learning rate for all parameters except the backbone.
         optimizer_weight_decay: Weight decay for the AdamW optimizer.
         optimizer_lr_backbone: Learning rate for the backbone parameters.
@@ -78,6 +84,10 @@ class CNNBCConfig(PreTrainedConfig):
     hidden_dims: tuple[int, ...] = (512, 256)
     dropout: float = 0.1
 
+    # History context fed to the FC head.
+    state_history_size: int = 0
+    action_history_size: int = 0
+
     # Training preset.
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-4
@@ -98,6 +108,14 @@ class CNNBCConfig(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `n_obs_steps={self.n_obs_steps}`"
+            )
+        if self.state_history_size < 0:
+            raise ValueError(
+                f"`state_history_size` must be non-negative. Got {self.state_history_size}."
+            )
+        if self.action_history_size < 0:
+            raise ValueError(
+                f"`action_history_size` must be non-negative. Got {self.action_history_size}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:
