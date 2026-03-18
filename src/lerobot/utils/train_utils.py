@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
+import platform
+import shutil
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -59,8 +61,16 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
     if last_checkpoint_dir.is_symlink():
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
-    last_checkpoint_dir.symlink_to(relative_target)
-
+    #If we are on windows.
+    if platform.system() == "Windows":
+        # Create a hard copy of the checkpoint directory instead of a symlink.
+        # Remove old last checkpoint directory if it exists.
+        if last_checkpoint_dir.is_dir():
+            shutil.rmtree(last_checkpoint_dir)
+        shutil.copytree(checkpoint_dir, last_checkpoint_dir)
+          
+    else:
+        last_checkpoint_dir.symlink_to(relative_target)
 
 def save_checkpoint(
     checkpoint_dir: Path,
