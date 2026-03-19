@@ -165,6 +165,17 @@ def _notify_zmq_cameras(robot: Robot, event_type: str) -> None:
             cam.send_event(event_type)
 
 
+def _set_zmq_suppress_warnings(robot: Robot, suppress: bool) -> None:
+    """Enable or disable warning suppression on all ZMQ cameras."""
+    from lerobot.cameras.zmq import ZMQCamera
+
+    if not hasattr(robot, "cameras"):
+        return
+    for cam in robot.cameras.values():
+        if isinstance(cam, ZMQCamera):
+            cam.suppress_warnings = suppress
+
+
 def _send_features_to_zmq_cameras(robot: Robot, obs: dict) -> None:
     """Send robot observations (features) to all connected ZMQ cameras.
 
@@ -657,6 +668,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     break
 
                 # --- Segmentation / guide frame phase -------------------------
+                # Suppress ZMQ camera timeout warnings during segmentation
+                _set_zmq_suppress_warnings(robot, True)
                 _notify_zmq_cameras(robot, "reset_done")
                 logging.info("Reset done. Sent reset_done event to image server.")
 
@@ -669,6 +682,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 events["exit_early"] = False
                 while not events["exit_early"] and not events["stop_recording"]:
                     time.sleep(0.1)
+
+                _set_zmq_suppress_warnings(robot, False)
 
                 if events["stop_recording"]:
                     logging.info("ESC pressed while waiting. Stopping recording.")

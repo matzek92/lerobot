@@ -109,6 +109,7 @@ class ZMQCamera(Camera):
         self.event_socket: zmq.Socket | None = None
         self.features_socket: zmq.Socket | None = None
         self._connected = False
+        self.suppress_warnings = False
 
         # Threading resources
         self.thread: Thread | None = None
@@ -406,7 +407,8 @@ class ZMQCamera(Camera):
             except (TimeoutError, Exception) as e:
                 if failure_count <= 10:
                     failure_count += 1
-                    logger.warning(f"Read error: {e}")
+                    if not self.suppress_warnings:
+                        logger.warning(f"Read error: {e}")
                 else:
                     raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
 
