@@ -137,7 +137,18 @@ def run_client(
             # Decode frame --------------------------------------------------
             if len(parts) > 1:
                 # Protocol v2: multipart binary JPEG
-                meta = json.loads(parts[0].decode("utf-8"))
+                try:
+                    meta = json.loads(parts[0].decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                    # Debug: log first few bytes to identify the issue
+                    first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                    logger.error(
+                        f"Failed to decode metadata as JSON. "
+                        f"First bytes: {first_bytes.hex()}, "
+                        f"Parts count: {len(parts)}, "
+                        f"Error: {e}"
+                    )
+                    continue
                 cameras = meta.get("cameras", [])
 
                 # Decode all camera images into a dict
@@ -179,7 +190,16 @@ def run_client(
                 # Legacy protocol v1: single-part JSON / base64
                 import base64
 
-                data = json.loads(parts[0].decode("utf-8"))
+                try:
+                    data = json.loads(parts[0].decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                    first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                    logger.error(
+                        f"Failed to decode legacy message as JSON. "
+                        f"First bytes: {first_bytes.hex()}, "
+                        f"Error: {e}"
+                    )
+                    continue
                 images = data.get("images", {})
 
                 if not images:

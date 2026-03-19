@@ -743,8 +743,13 @@ def interactive_select(
                 labels.append(0)
                 _update_mask()
 
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(window_name, _on_mouse)
+    # IMPORTANT: OpenCV QT5 backend has a bug where cvSetMouseCallback fails
+    # to find the window by name if the name contains non-ASCII characters
+    # (e.g. em-dash U+2013). Sanitise the window name to ASCII only.
+    _safe_window_name = window_name.encode("ascii", errors="replace").decode("ascii")
+
+    cv2.namedWindow(_safe_window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(_safe_window_name, _on_mouse)
 
     instructions = (
         "L-click: fg | R-click: bg | Wheel: zoom | Mid-drag: pan | "
@@ -801,7 +806,7 @@ def interactive_select(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
             )
 
-            cv2.imshow(window_name, display)
+            cv2.imshow(_safe_window_name, display)
             key = cv2.waitKey(30) & 0xFF
 
             if key == 13:  # Enter – confirm
@@ -825,7 +830,7 @@ def interactive_select(
                 offset_x = 0.0
                 offset_y = 0.0
     finally:
-        cv2.destroyWindow(window_name)
+        cv2.destroyWindow(_safe_window_name)
 
     if return_points:
         return (*result, list(points), list(labels))

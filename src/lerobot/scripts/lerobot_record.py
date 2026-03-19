@@ -603,42 +603,83 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 _notify_zmq_cameras(robot, "episode_end")
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
+                # --- Handle episode result ------------------------------------
+                # ESC during episode → save episode and stop recording entirely
+                if events["stop_recording"]:
+                    logging.info("ESC pressed during episode. Saving episode and stopping.")
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                    break
 
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
-
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
-                    _notify_zmq_cameras(robot, "reset_done")
-
+                # LEFT during episode → discard and go to reset/segmentation
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
-                    continue
+                    # Fall through to reset phase (don't continue/skip)
+                else:
+                    # Normal end (RIGHT or time elapsed) → save episode
+                    dataset.save_episode()
+                    recorded_episodes += 1
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                    # Skip reset for the last episode
+                    is_last_episode = recorded_episodes >= cfg.dataset.num_episodes
+                    if is_last_episode or events["stop_recording"]:
+                        break
+
+                log_say("Reset the environment", cfg.play_sounds)
+                logging.info(
+                    "Reset phase: move robot to start position. "
+                    "Press RIGHT ARROW to finish reset early."
+                )
+
+                # reset g1 robot
+                if robot.name == "unitree_g1":
+                    robot.reset()
+
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    teleop=teleop,
+                    control_time_s=cfg.dataset.reset_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                )
+
+                # ESC during reset → stop recording (episode already saved above)
+                if events["stop_recording"]:
+                    logging.info("ESC pressed during reset. Stopping recording.")
+                    break
+
+                # --- Segmentation / guide frame phase -------------------------
+                _notify_zmq_cameras(robot, "reset_done")
+                logging.info("Reset done. Sent reset_done event to image server.")
+
+                # --- Wait for user to press RIGHT ARROW to start next episode -
+                log_say("Press right arrow to start next episode", cfg.play_sounds)
+                logging.info(
+                    "Waiting for RIGHT ARROW to start next episode... "
+                    "(ESC to stop recording)"
+                )
+                events["exit_early"] = False
+                while not events["exit_early"] and not events["stop_recording"]:
+                    time.sleep(0.1)
+
+                if events["stop_recording"]:
+                    logging.info("ESC pressed while waiting. Stopping recording.")
+                    break
+
+                # Clear the exit_early flag so it doesn't interfere with next episode
+                events["exit_early"] = False
+                logging.info("Starting next episode...")
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+        _notify_zmq_cameras(robot, "recording_stop")
 
         if dataset:
             dataset.finalize()

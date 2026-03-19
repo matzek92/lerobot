@@ -144,9 +144,15 @@ class ZMQCamera(Camera):
             self.socket = self.context.socket(zmq.SUB)
             self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
             self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            self.socket.setsockopt(zmq.CONFLATE, True)
+            # NOTE: CONFLATE does NOT work with multipart messages!
+            # It can cause incomplete messages where parts get mixed up.
+            # self.socket.setsockopt(zmq.CONFLATE, True)
             self.socket.connect(f"tcp://{self.server_address}:{self.port}")
             self._connected = True
+            
+            # Important: Give SUB socket time to establish connection with PUB
+            # Without this, early frames may be lost ("slow joiner" problem)
+            time.sleep(0.1)
 
             # Set up event notification socket if event_port is configured
             if self.config.event_port is not None:
@@ -276,9 +282,33 @@ class ZMQCamera(Camera):
                 raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
             raise
 
+        # Drain buffer: keep only the latest complete multipart message
+        # This ensures we don't have stale frames accumulating
+        while True:
+            try:
+                import zmq
+                newer = self.socket.recv_multipart(zmq.NOBLOCK)
+                parts = newer
+            except Exception as e:
+                if type(e).__name__ == "Again":
+                    break
+                # Other errors should be raised
+                raise
+
         if len(parts) > 1:
             # Protocol v2: multipart binary JPEG
-            meta = json.loads(parts[0].decode("utf-8"))
+            try:
+                meta = json.loads(parts[0].decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                # Debug: log first few bytes to identify the issue
+                first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                logger.error(
+                    f"{self} failed to decode metadata as JSON. "
+                    f"First bytes: {first_bytes.hex()}, "
+                    f"Parts count: {len(parts)}, "
+                    f"Error: {e}"
+                )
+                raise RuntimeError(f"{self} received invalid metadata format") from e
             cameras = meta.get("cameras", [])
 
             if self.camera_name in cameras:
@@ -292,7 +322,16 @@ class ZMQCamera(Camera):
             frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
         else:
             # Legacy protocol v1: single-part JSON / base64
-            data = json.loads(parts[0].decode("utf-8"))
+            try:
+                data = json.loads(parts[0].decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                logger.error(
+                    f"{self} failed to decode legacy message as JSON. "
+                    f"First bytes: {first_bytes.hex()}, "
+                    f"Error: {e}"
+                )
+                raise RuntimeError(f"{self} received invalid legacy message format") from e
 
             if "images" not in data:
                 raise RuntimeError(f"{self} invalid message: missing 'images' key")
