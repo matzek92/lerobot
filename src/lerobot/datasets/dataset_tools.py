@@ -148,6 +148,225 @@ def delete_episodes(
     return new_dataset
 
 
+def copy_episodes(
+    src_dataset: LeRobotDataset,
+    episode_indices: list[int] | None = None,
+    camera_keys: list[str] | None = None,
+    camera_key_mapping: dict[str, str] | None = None,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
+) -> LeRobotDataset:
+    """Copy episodes from a source dataset to a new or existing target dataset.
+
+    Supports selecting a subset of episodes and/or camera streams to copy.
+    Camera streams can optionally be renamed via ``camera_key_mapping``.  All
+    non-camera features (e.g. action, observation.state) are always copied.
+
+    When *append_to_dataset* is provided the selected episodes are **appended
+    to that existing dataset** rather than written to a new one.  This enables
+    incremental workflows where episodes from multiple source datasets are
+    accumulated in a single target.
+
+    Args:
+        src_dataset: The source :class:`LeRobotDataset` to copy from.
+        episode_indices: List of episode indices to copy.  ``None`` copies all
+            episodes in the source dataset.
+        camera_keys: List of camera/video stream keys (``dtype="image"`` or
+            ``dtype="video"``) to include in the copy.  ``None`` copies all
+            camera streams present in the source dataset.
+        camera_key_mapping: Optional dict mapping source camera key names to
+            target camera key names.  Only keys that are being copied (as
+            determined by *camera_keys*) can appear in the mapping.  Keys not
+            in the mapping are kept under their original name.
+        output_dir: Directory to save the new dataset.  Ignored when
+            *append_to_dataset* is given.  If ``None`` and no append target,
+            uses the default location based on *repo_id*.
+        repo_id: Repository ID for the new dataset.  Ignored when
+            *append_to_dataset* is given.  If ``None`` and no append target,
+            appends ``"_copied"`` to the source repo_id.
+        append_to_dataset: When provided, the copied episodes are appended to
+            this existing dataset rather than written to a new one.
+            *output_dir* and *repo_id* must be ``None`` when this argument is
+            used.  The source and target datasets must have compatible features
+            (after applying *camera_key_mapping*) and the same FPS.
+
+    Returns:
+        :class:`LeRobotDataset` containing the copied episodes — either the
+        newly created dataset or the updated *append_to_dataset* target.
+
+    Example::
+
+        # Copy all episodes to a new dataset, renaming one camera stream
+        new_dataset = copy_episodes(
+            src_dataset,
+            camera_key_mapping={"observation.images.top": "observation.images.main"},
+            output_dir="./output",
+        )
+
+        # Copy specific episodes and only one camera to an existing dataset
+        target = LeRobotDataset("my_repo", root="./target")
+        copy_episodes(
+            src_dataset,
+            episode_indices=[0, 2, 5],
+            camera_keys=["observation.images.top"],
+            append_to_dataset=target,
+        )
+    """
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'. "
+            "When appending to an existing dataset, the output directory is determined by that dataset."
+        )
+
+    total_src_episodes = src_dataset.meta.total_episodes
+    valid_indices = set(range(total_src_episodes))
+
+    if episode_indices is None:
+        episode_indices = list(range(total_src_episodes))
+
+    if not episode_indices:
+        raise ValueError("No episodes to copy")
+
+    invalid = set(episode_indices) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    # Determine which camera/image keys to copy.
+    src_camera_keys = src_dataset.meta.camera_keys
+    if camera_keys is not None:
+        invalid_keys = set(camera_keys) - set(src_camera_keys)
+        if invalid_keys:
+            raise ValueError(f"Camera keys not found in source dataset: {invalid_keys}")
+        camera_keys_to_copy = list(camera_keys)
+    else:
+        camera_keys_to_copy = list(src_camera_keys)
+
+    camera_key_mapping = camera_key_mapping or {}
+
+    invalid_map_keys = set(camera_key_mapping.keys()) - set(camera_keys_to_copy)
+    if invalid_map_keys:
+        raise ValueError(
+            f"camera_key_mapping references keys not selected for copying: {invalid_map_keys}"
+        )
+
+    # Build the feature dict for the target dataset.
+    # All non-camera features are kept; camera features are filtered and renamed.
+    src_user_features = {k: v for k, v in src_dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+
+    target_features: dict = {}
+    for src_key, feat in src_user_features.items():
+        if feat["dtype"] in ("video", "image"):
+            if src_key not in camera_keys_to_copy:
+                continue  # Camera not requested — skip.
+            target_key = camera_key_mapping.get(src_key, src_key)
+        else:
+            target_key = src_key
+        target_features[target_key] = feat
+
+    # Separate the video keys that are being copied (after possible rename).
+    src_video_keys_to_copy = [k for k in camera_keys_to_copy if k in src_dataset.meta.video_keys]
+
+    if append_to_dataset is not None:
+        # Validate feature compatibility between source and target.
+        target_user_features = {
+            k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
+        }
+        if set(target_features.keys()) != set(target_user_features.keys()):
+            raise ValueError(
+                f"Feature mismatch between source dataset and append target. "
+                f"Source (after filtering/renaming) has: {set(target_features.keys())}, "
+                f"Target has: {set(target_user_features.keys())}"
+            )
+        if src_dataset.meta.fps != append_to_dataset.meta.fps:
+            raise ValueError(
+                f"FPS mismatch: source dataset has {src_dataset.meta.fps} fps "
+                f"but target dataset has {append_to_dataset.meta.fps} fps"
+            )
+        if append_to_dataset.latest_episode is not None:
+            append_to_dataset._writer_closed_for_reading = True
+        append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+        write_target = append_to_dataset
+    else:
+        if repo_id is None:
+            repo_id = f"{src_dataset.repo_id}_copied"
+        output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+        write_target = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=src_dataset.meta.fps,
+            features=target_features,
+            robot_type=src_dataset.meta.robot_type,
+            root=output_dir,
+            use_videos=len(src_video_keys_to_copy) > 0,
+        )
+
+    src_dataset._ensure_hf_dataset_loaded()
+
+    has_video = len(src_video_keys_to_copy) > 0
+
+    for ep_idx in tqdm(sorted(episode_indices), desc="Copying episodes"):
+        ep_meta = src_dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        # Batch-decode all video frames for this episode.
+        video_frames: dict[str, np.ndarray] = {}
+        if has_video:
+            for src_vid_key in src_video_keys_to_copy:
+                from_ts = ep_meta[f"videos/{src_vid_key}/from_timestamp"]
+                timestamps = [from_ts + i / src_dataset.fps for i in range(ep_length)]
+                video_path = src_dataset.root / src_dataset.meta.get_video_file_path(ep_idx, src_vid_key)
+                frames_tensor = decode_video_frames(
+                    video_path, timestamps, src_dataset.tolerance_s, src_dataset.video_backend
+                )
+                target_vid_key = camera_key_mapping.get(src_vid_key, src_vid_key)
+                video_frames[target_vid_key] = frames_tensor.numpy()  # (N, C, H, W) float32
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = src_dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = src_dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            # Video features: CHW float32 [0, 1] → HWC float32 [0, 1].
+            for target_vid_key, frames_arr in video_frames.items():
+                frame[target_vid_key] = frames_arr[i].transpose(1, 2, 0)
+
+            # Image and numerical features.
+            for src_key, feat in src_user_features.items():
+                if feat["dtype"] == "video":
+                    continue  # Already handled above.
+                if feat["dtype"] == "image":
+                    if src_key not in camera_keys_to_copy:
+                        continue  # Camera not requested — skip.
+                    target_key = camera_key_mapping.get(src_key, src_key)
+                    # hf_transform_to_torch converts PIL → CHW float32 [0, 1].
+                    # add_frame / write_image expects HWC uint8 [0, 255].
+                    frame[target_key] = (item[src_key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[src_key] = item[src_key].numpy()
+
+            write_target.add_frame(frame)
+
+        write_target.save_episode()
+
+    write_target.finalize()
+    write_target._ensure_hf_dataset_loaded()
+
+    action = "Appended copied episodes to" if append_to_dataset is not None else "Created"
+    logging.info(
+        f"{action} dataset: {write_target.meta.total_episodes} episodes, "
+        f"{write_target.meta.total_frames} frames"
+    )
+    return write_target
+
+
 def trim_episodes(
     dataset: LeRobotDataset,
     episode_trim_specs: dict[int, tuple[int, int]],

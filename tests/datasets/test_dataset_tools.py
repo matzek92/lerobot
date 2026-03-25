@@ -25,6 +25,7 @@ from lerobot.datasets.dataset_tools import (
     add_black_stream,
     add_features,
     add_guide_stream,
+    copy_episodes,
     delete_episodes,
     merge_datasets,
     modify_features,
@@ -1908,3 +1909,205 @@ def test_add_black_stream_duplicate_key(video_dataset_for_guide, tmp_path):
             output_dir=tmp_path / "out_dup",
             repo_id="test/black_dup",
         )
+
+
+# ---------------------------------------------------------------------------
+# copy_episodes tests
+# ---------------------------------------------------------------------------
+
+
+def test_copy_episodes_all(sample_dataset, tmp_path):
+    """Copy all episodes to a new dataset — result is equivalent to source."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, output_dir=output_dir)
+
+    assert new_dataset.meta.total_episodes == sample_dataset.meta.total_episodes
+    assert new_dataset.meta.total_frames == sample_dataset.meta.total_frames
+    assert len(new_dataset) == len(sample_dataset)
+
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(sample_dataset.meta.total_episodes))
+
+
+def test_copy_episodes_subset(sample_dataset, tmp_path):
+    """Copy only a subset of episodes."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, episode_indices=[0, 2, 4], output_dir=output_dir)
+
+    assert new_dataset.meta.total_episodes == 3
+    assert new_dataset.meta.total_frames == 30
+    assert len(new_dataset) == 30
+
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == [0, 1, 2]  # re-indexed starting from 0
+
+
+def test_copy_episodes_filter_camera_keys(sample_dataset, tmp_path):
+    """Copy only selected camera streams — excluded cameras are absent in target."""
+    output_dir = tmp_path / "copied"
+    # sample_dataset has 'observation.images.top' as the only image key
+    new_dataset = copy_episodes(
+        sample_dataset,
+        camera_keys=["observation.images.top"],
+        output_dir=output_dir,
+    )
+
+    assert "observation.images.top" in new_dataset.meta.features
+    assert "action" in new_dataset.meta.features
+    assert "observation.state" in new_dataset.meta.features
+    assert new_dataset.meta.total_frames == sample_dataset.meta.total_frames
+
+
+def test_copy_episodes_empty_camera_keys_excludes_all_cameras(sample_dataset, tmp_path):
+    """Passing an empty camera_keys list copies no camera streams."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, camera_keys=[], output_dir=output_dir)
+
+    assert "observation.images.top" not in new_dataset.meta.features
+    # Non-camera features should still be present
+    assert "action" in new_dataset.meta.features
+    assert "observation.state" in new_dataset.meta.features
+
+
+def test_copy_episodes_camera_key_mapping(sample_dataset, tmp_path):
+    """Camera streams can be renamed via camera_key_mapping."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(
+        sample_dataset,
+        camera_key_mapping={"observation.images.top": "observation.images.renamed"},
+        output_dir=output_dir,
+    )
+
+    assert "observation.images.renamed" in new_dataset.meta.features
+    assert "observation.images.top" not in new_dataset.meta.features
+    # Non-camera features unchanged
+    assert "action" in new_dataset.meta.features
+
+
+def test_copy_episodes_invalid_episode_index(sample_dataset, tmp_path):
+    """Invalid episode index raises ValueError."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        copy_episodes(
+            sample_dataset,
+            episode_indices=[99],
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_invalid_camera_key(sample_dataset, tmp_path):
+    """Camera key not present in source raises ValueError."""
+    with pytest.raises(ValueError, match="Camera keys not found"):
+        copy_episodes(
+            sample_dataset,
+            camera_keys=["observation.images.nonexistent"],
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_mapping_references_uncopied_key(sample_dataset, tmp_path):
+    """camera_key_mapping referencing a key not in camera_keys raises ValueError."""
+    with pytest.raises(ValueError, match="camera_key_mapping references keys not selected"):
+        copy_episodes(
+            sample_dataset,
+            camera_keys=[],  # no cameras selected
+            camera_key_mapping={"observation.images.top": "observation.images.renamed"},
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_empty_list_raises(sample_dataset, tmp_path):
+    """Passing an empty episode_indices list raises ValueError."""
+    with pytest.raises(ValueError, match="No episodes to copy"):
+        copy_episodes(sample_dataset, episode_indices=[], output_dir=tmp_path / "copied")
+
+
+def test_copy_episodes_append_to_existing(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Episodes can be appended to an existing target dataset."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for ep_idx in range(2):
+        for _ in range(10):
+            frame = {
+                "action": np.random.randn(6).astype(np.float32),
+                "observation.state": np.random.randn(4).astype(np.float32),
+                "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+                "task": "task_target",
+            }
+            target_dataset.add_frame(frame)
+        target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # Append 3 episodes from sample_dataset (each with 10 frames) to target.
+    result = copy_episodes(
+        sample_dataset,
+        episode_indices=[0, 1, 2],
+        append_to_dataset=target_dataset,
+    )
+
+    assert result is target_dataset
+    assert result.meta.total_episodes == 5   # 2 existing + 3 appended
+    assert result.meta.total_frames == 50    # 20 existing + 30 appended
+    assert len(result) == 50
+
+    episode_indices = sorted({int(idx.item()) for idx in result.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(5))
+
+
+def test_copy_episodes_append_conflicts_with_output_dir(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Specifying both append_to_dataset and output_dir raises ValueError."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "task_target",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Cannot specify 'output_dir' or 'repo_id'"):
+        copy_episodes(
+            sample_dataset,
+            output_dir=tmp_path / "other",
+            append_to_dataset=target_dataset,
+        )
+
+
+def test_copy_episodes_append_feature_mismatch(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Appending to a dataset with incompatible features raises ValueError."""
+    # Create target with a different feature set
+    features = {
+        "action": {"dtype": "float32", "shape": (3,), "names": None},  # different shape
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(3).astype(np.float32),
+            "task": "task_target",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Feature mismatch"):
+        copy_episodes(sample_dataset, append_to_dataset=target_dataset)
