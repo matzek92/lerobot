@@ -1908,3 +1908,122 @@ def test_add_black_stream_duplicate_key(video_dataset_for_guide, tmp_path):
             output_dir=tmp_path / "out_dup",
             repo_id="test/black_dup",
         )
+
+
+def test_add_black_stream_episode_indices(video_dataset_for_guide, tmp_path):
+    """Test adding a black stream for only a subset of episodes."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+    black_dir = tmp_path / "black_partial"
+
+    episode_indices = [0, 2]  # Skip episode 1
+    black_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=black_dir,
+        repo_id="test/black_partial",
+        episode_indices=episode_indices,
+    )
+
+    # Only the requested episodes should be present
+    assert black_dataset.meta.total_episodes == len(episode_indices)
+
+    # The black stream must exist as a video key
+    assert new_key in black_dataset.meta.video_keys
+
+    # A black video file must exist for every episode in the result
+    for ep_idx in range(black_dataset.meta.total_episodes):
+        black_path = black_dataset.root / black_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert black_path.exists(), f"Black video file should exist: {black_path}"
+
+    # Feature shape must match source
+    assert black_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+
+def test_add_black_stream_episode_indices_invalid(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError for out-of-range episode indices."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=f"{source_key}_black",
+            output_dir=tmp_path / "out_invalid",
+            repo_id="test/black_invalid",
+            episode_indices=[0, 99],  # 99 is out of range
+        )
+
+
+def test_add_black_stream_append_to_dataset(video_dataset_for_guide, tmp_path, empty_lerobot_dataset_factory):
+    """Test appending black stream episodes from one dataset to an existing target dataset."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+
+    # Create the initial target dataset with the first episode processed
+    target_dir = tmp_path / "target_ds"
+    target_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=target_dir,
+        repo_id="test/target_black",
+        episode_indices=[0],
+    )
+
+    initial_episodes = target_dataset.meta.total_episodes
+    initial_frames = target_dataset.meta.total_frames
+
+    # Reload target dataset from disk before appending
+    target_dataset = LeRobotDataset(repo_id=target_dataset.repo_id, root=target_dataset.root)
+
+    # Append the remaining episodes to the target dataset
+    result_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        episode_indices=[1, 2],
+        append_to_dataset=target_dataset,
+    )
+
+    # All episodes should now be in the target dataset
+    # The black stream must be present
+    assert new_key in result_dataset.meta.video_keys
+
+    # Episode count grew by 2
+    assert result_dataset.meta.total_episodes == initial_episodes + 2
+
+
+def test_add_black_stream_append_rejects_output_dir(video_dataset_for_guide, tmp_path, empty_lerobot_dataset_factory):
+    """Test that specifying both append_to_dataset and output_dir raises an error."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+
+    # Build a minimal target dataset to pass as append_to_dataset
+    target_dir = tmp_path / "target_ds"
+    target_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=target_dir,
+        repo_id="test/target_black",
+        episode_indices=[0],
+    )
+    target_dataset = LeRobotDataset(repo_id=target_dataset.repo_id, root=target_dataset.root)
+
+    with pytest.raises(ValueError, match="Cannot specify"):
+        add_black_stream(
+            dataset=video_dataset,
+            source_key=source_key,
+            new_key=new_key,
+            output_dir=tmp_path / "conflicting_dir",
+            append_to_dataset=target_dataset,
+        )
+
