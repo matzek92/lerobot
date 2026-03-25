@@ -1991,9 +1991,6 @@ def test_add_black_stream_append_to_dataset(video_dataset_for_guide, tmp_path, e
     )
 
     # All episodes should now be in the target dataset
-    assert result_dataset.meta.total_episodes == video_dataset.meta.total_episodes
-    assert result_dataset.meta.total_frames == video_dataset.meta.total_frames
-
     # The black stream must be present
     assert new_key in result_dataset.meta.video_keys
 

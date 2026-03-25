@@ -2629,12 +2629,14 @@ def _write_filtered_episodes_metadata(
 
     # Ensure chunk/file index columns are stored as integers (not floats).
     # pandas may promote int columns to float when new columns are added via loc.
-    int_cols = [c for c in src_df_filtered.columns if
-                c.endswith("/chunk_index") or c.endswith("/file_index") or
-                c in ("episode_index", "length", "dataset_from_index", "dataset_to_index")]
+    int_col_suffixes = ("/chunk_index", "/file_index")
+    int_col_names = ("episode_index", "length", "dataset_from_index", "dataset_to_index")
+    int_cols = [
+        c for c in src_df_filtered.columns
+        if c.endswith(int_col_suffixes) or c in int_col_names
+    ]
     for col in int_cols:
-        if col in src_df_filtered.columns:
-            src_df_filtered[col] = src_df_filtered[col].astype("Int64")
+        src_df_filtered[col] = src_df_filtered[col].astype("Int64")
 
     # Write to a single parquet file in the destination
     dst_episodes_path = dst_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
@@ -3006,8 +3008,10 @@ def _add_black_stream_filtered(
         ordered_new_indices = [e[1] for e in ep_entries_sorted]
         ordered_old_indices = [e[2] for e in ep_entries_sorted]
 
-        episode_lengths = {new_idx: dataset.meta.episodes[old_idx]["length"]
-                           for new_idx, old_idx in zip(ordered_new_indices, ordered_old_indices)}
+        episode_lengths = {
+            new_idx: dataset.meta.episodes[old_idx]["length"]
+            for new_idx, old_idx in zip(ordered_new_indices, ordered_old_indices)
+        }
 
         out_video_path = new_meta.root / new_meta.video_path.format(
             video_key=new_key, chunk_index=chunk_idx, file_index=file_idx
