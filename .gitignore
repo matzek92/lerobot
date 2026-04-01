@@ -16,7 +16,10 @@
 .env
 .venv
 env/
+*.exe
+*.dll
 venv/
+viz/
 env.bak/
 venv.bak/
 .python-version

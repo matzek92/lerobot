@@ -37,21 +37,33 @@ import torch
 from tqdm import tqdm
 
 from lerobot.datasets.aggregate import aggregate_datasets
-from lerobot.datasets.compute_stats import aggregate_stats
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.compute_stats import (
+    aggregate_stats,
+    compute_episode_stats,
+    compute_relative_action_stats,
+)
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.io_utils import (
+    get_parquet_file_size_in_mb,
+    load_episodes,
+    write_info,
+    write_stats,
+    write_tasks,
+)
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import (
     DATA_DIR,
+    DEFAULT_FEATURES,
+    EPISODES_DIR,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
     DEFAULT_FEATURES,
+    EPISODES_DIR,
     get_parquet_file_size_in_mb,
     load_episodes,
     update_chunk_file_indices,
-    write_info,
-    write_stats,
-    write_tasks,
 )
 from lerobot.datasets.video_utils import (
     _get_codec_options,
@@ -60,7 +72,7 @@ from lerobot.datasets.video_utils import (
     get_video_info,
     resolve_vcodec,
 )
-from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_IMAGE, OBS_STATE
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -96,8 +108,8 @@ def delete_episodes(
     Args:
         dataset: The source LeRobotDataset.
         episode_indices: List of episode indices to delete.
-        output_dir: Directory to save the new dataset. If None, uses default location.
-        repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
+        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
     """
     if not episode_indices:
         raise ValueError("No episodes to delete")
@@ -735,7 +747,7 @@ def split_dataset(
         dataset: The source LeRobotDataset to split.
         splits: Either a dict mapping split names to episode indices, or a dict mapping
                 split names to fractions (must sum to <= 1.0).
-        output_dir: Base directory for output datasets. If None, uses default location.
+        output_dir: Root directory where the split datasets will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id.
 
     Examples:
       Split by specific episodes
@@ -826,8 +838,8 @@ def merge_datasets(
 
     Args:
         datasets: List of LeRobotDatasets to merge.
-        output_repo_id: Repository ID for the merged dataset.
-        output_dir: Directory to save the merged dataset. If None, uses default location.
+        output_repo_id: Merged dataset identifier.
+        output_dir: Root directory where the merged dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/output_repo_id.
     """
     if not datasets:
         raise ValueError("No datasets to merge")
@@ -871,8 +883,8 @@ def modify_features(
         dataset: The source LeRobotDataset.
         add_features: Optional dict mapping feature names to (feature_values, feature_info) tuples.
         remove_features: Optional feature name(s) to remove. Can be a single string or list.
-        output_dir: Directory to save the new dataset. If None, uses default location.
-        repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
+        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
 
     Returns:
         New dataset with features modified.
@@ -973,8 +985,8 @@ def add_features(
     Args:
         dataset: The source LeRobotDataset.
         features: Dictionary mapping feature names to (feature_values, feature_info) tuples.
-        output_dir: Directory to save the new dataset. If None, uses default location.
-        repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
+        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
 
     Returns:
         New dataset with all features added.
@@ -1010,8 +1022,8 @@ def remove_feature(
     Args:
         dataset: The source LeRobotDataset.
         feature_names: Name(s) of features to remove. Can be a single string or list.
-        output_dir: Directory to save the new dataset. If None, uses default location.
-        repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
+        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
 
     Returns:
         New dataset with features removed.
@@ -1471,7 +1483,7 @@ def _copy_and_reindex_episodes_metadata(
 
         total_frames += src_episode["length"]
 
-    dst_meta._close_writer()
+    dst_meta.finalize()
 
     dst_meta.info.update(
         {
@@ -1498,7 +1510,8 @@ def _write_parquet(df: pd.DataFrame, path: Path, meta: LeRobotDatasetMetadata) -
 
     This ensures images are properly embedded and the file can be loaded correctly by HF datasets.
     """
-    from lerobot.datasets.utils import embed_images, get_hf_features_from_features
+    from lerobot.datasets.feature_utils import get_hf_features_from_features
+    from lerobot.datasets.io_utils import embed_images
 
     hf_features = get_hf_features_from_features(meta.features)
     ep_dataset = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=hf_features, split="train")
@@ -2058,7 +2071,9 @@ def modify_tasks(
 
     # Collect all unique tasks and create new task mapping
     unique_tasks = sorted(set(episode_to_task.values()))
-    new_task_df = pd.DataFrame({"task_index": list(range(len(unique_tasks)))}, index=unique_tasks)
+    new_task_df = pd.DataFrame(
+        {"task_index": list(range(len(unique_tasks)))}, index=pd.Index(unique_tasks, name="task")
+    )
     task_to_index = {task: idx for idx, task in enumerate(unique_tasks)}
 
     logging.info(f"Modifying tasks in {dataset.repo_id}")
@@ -2110,9 +2125,117 @@ def modify_tasks(
     return dataset
 
 
+def recompute_stats(
+    dataset: LeRobotDataset,
+    skip_image_video: bool = True,
+    relative_action: bool = False,
+    relative_exclude_joints: list[str] | None = None,
+    chunk_size: int = 50,
+    num_workers: int = 0,
+) -> LeRobotDataset:
+    """Recompute stats.json from scratch by iterating all episodes.
+
+    Args:
+        dataset: The LeRobotDataset to recompute stats for.
+        skip_image_video: If True (default), only recompute stats for numeric features
+            (action, state, etc.) and keep existing image/video stats unchanged.
+        relative_action: If True, compute action stats in relative space by
+            iterating all valid action chunks and subtracting the current state.
+            This matches the normalization distribution the model sees during
+            training with ``use_relative_actions=True``.
+        relative_exclude_joints: Joint names to exclude from relative conversion when
+            relative_action=True. These dims keep absolute stats.
+        chunk_size: Action chunk size used for relative stats computation. Should match
+            ``policy.chunk_size``. Only used when ``relative_action=True``.
+        num_workers: Number of parallel threads for relative action stats computation.
+            Values ≤1 mean single-threaded. Only used when ``relative_action=True``.
+
+    Returns:
+        The same dataset with updated stats.
+    """
+    features = dataset.meta.features
+    meta_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
+    numeric_features = {
+        k: v
+        for k, v in features.items()
+        if v["dtype"] not in ["image", "video", "string"] and k not in meta_keys
+    }
+
+    if skip_image_video:
+        features_to_compute = numeric_features
+    else:
+        features_to_compute = {
+            k: v for k, v in features.items() if v["dtype"] != "string" and k not in meta_keys
+        }
+
+    # When relative_action is enabled, compute action stats via chunk-based sampling
+    # (matching what the model sees during training) and skip action in the
+    # per-episode pass below.
+    relative_action_stats = None
+    if relative_action and ACTION in features and OBS_STATE in features:
+        if relative_exclude_joints is None:
+            relative_exclude_joints = ["gripper"]
+        relative_action_stats = compute_relative_action_stats(
+            hf_dataset=dataset.hf_dataset,
+            features=features,
+            chunk_size=chunk_size,
+            exclude_joints=relative_exclude_joints,
+            num_workers=num_workers,
+        )
+        features_to_compute.pop(ACTION, None)
+
+    logging.info(f"Recomputing stats for features: {list(features_to_compute.keys())}")
+
+    data_dir = dataset.root / DATA_DIR
+    parquet_files = sorted(data_dir.glob("*/*.parquet"))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {data_dir}")
+
+    all_episode_stats = []
+    numeric_keys = [k for k, v in features_to_compute.items() if v["dtype"] not in ["image", "video"]]
+
+    for parquet_path in tqdm(parquet_files, desc="Computing stats from data files"):
+        df = pd.read_parquet(parquet_path)
+
+        for ep_idx in sorted(df["episode_index"].unique()):
+            ep_df = df[df["episode_index"] == ep_idx]
+            episode_data = {}
+            for key in numeric_keys:
+                if key in ep_df.columns:
+                    values = ep_df[key].values
+                    if hasattr(values[0], "__len__"):
+                        episode_data[key] = np.stack(values)
+                    else:
+                        episode_data[key] = np.array(values)
+
+            ep_stats = compute_episode_stats(episode_data, features_to_compute)
+            all_episode_stats.append(ep_stats)
+
+    if features_to_compute and not all_episode_stats:
+        logging.warning("No episode stats computed")
+        return dataset
+
+    new_stats = aggregate_stats(all_episode_stats) if all_episode_stats else {}
+
+    if relative_action_stats is not None:
+        new_stats[ACTION] = relative_action_stats
+
+    # Merge: keep existing stats for features we didn't recompute
+    if dataset.meta.stats:
+        for key, value in dataset.meta.stats.items():
+            if key not in new_stats:
+                new_stats[key] = value
+
+    write_stats(new_stats, dataset.root)
+    dataset.meta.stats = new_stats
+
+    logging.info("Stats recomputed successfully")
+    return dataset
+
+
 def convert_image_to_video_dataset(
     dataset: LeRobotDataset,
-    output_dir: Path,
+    output_dir: Path | None = None,
     repo_id: str | None = None,
     vcodec: str = "libsvtav1",
     pix_fmt: str = "yuv420p",
@@ -2131,8 +2254,8 @@ def convert_image_to_video_dataset(
 
     Args:
         dataset: The source LeRobot dataset with images
-        output_dir: Directory to save the new video dataset
-        repo_id: Repository ID for the new dataset (default: original_id + "_video")
+        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
+        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
         vcodec: Video codec (default: libsvtav1)
         pix_fmt: Pixel format (default: yuv420p)
         g: Group of pictures size (default: 2)
@@ -2183,6 +2306,7 @@ def convert_image_to_video_dataset(
             # Video info will be updated after episodes are encoded
 
     # Create new metadata for video dataset
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
     new_meta = LeRobotDatasetMetadata.create(
         repo_id=repo_id,
         fps=dataset.meta.fps,
@@ -2773,9 +2897,110 @@ def _encode_black_video(
 
 
 # ---------------------------------------------------------------------------
-# Public API: add_black_stream
+# Helper: write filtered/reindexed episodes metadata for add_black_stream
 # ---------------------------------------------------------------------------
 
+
+def _write_filtered_episodes_metadata(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+    data_metadata: dict[int, dict],
+    video_metadata: dict[int, dict],
+) -> None:
+    """Write filtered and reindexed episodes metadata to the destination dataset.
+
+    This helper reads the source episodes metadata parquet files, filters to only
+    the selected episodes (given by *episode_mapping*), reindexes them sequentially,
+    applies the updated data and video file locations from *data_metadata* and
+    *video_metadata*, and writes the result to the destination.
+
+    Unlike :func:`_copy_and_reindex_episodes_metadata`, this function does **not**
+    require episodes to have stats columns or a ``meta/episodes/chunk_index`` key,
+    making it compatible with datasets created by :func:`convert_image_to_video_dataset`.
+
+    Args:
+        src_dataset: Source dataset to copy from.
+        dst_meta: Destination metadata object.
+        episode_mapping: Mapping from old episode indices to new sequential indices.
+        data_metadata: Dict mapping new episode index to its data file metadata.
+        video_metadata: Dict mapping new episode index to all video file metadata
+            (both existing streams and the new black stream columns).
+    """
+    src_episodes_dir = src_dataset.root / EPISODES_DIR
+    if not src_episodes_dir.exists():
+        return
+
+    # Read all source episodes metadata into a single DataFrame
+    all_dfs = []
+    for f in sorted(src_episodes_dir.rglob("*.parquet")):
+        df = pd.read_parquet(f)
+        all_dfs.append(df)
+
+    if not all_dfs:
+        return
+
+    src_df = pd.concat(all_dfs, ignore_index=True)
+
+    # Filter to only the selected old episode indices
+    old_indices = set(episode_mapping.keys())
+    src_df_filtered = src_df[src_df["episode_index"].isin(old_indices)].copy()
+
+    # Map old episode_index → new episode_index
+    src_df_filtered["episode_index"] = src_df_filtered["episode_index"].map(episode_mapping)
+
+    # Apply updated data file locations
+    for new_idx, dmeta in data_metadata.items():
+        mask = src_df_filtered["episode_index"] == new_idx
+        for col, val in dmeta.items():
+            src_df_filtered.loc[mask, col] = val
+
+    # Apply updated video metadata (existing streams + new black stream columns)
+    for new_idx, vmeta in video_metadata.items():
+        mask = src_df_filtered["episode_index"] == new_idx
+        for col, val in vmeta.items():
+            src_df_filtered.loc[mask, col] = val
+
+    # Drop columns that are specific to the add_frame/save_episode pipeline
+    # (they won't be present in datasets created by convert_image_to_video_dataset)
+    for drop_col in ["meta/episodes/chunk_index", "meta/episodes/file_index", "tasks"]:
+        if drop_col in src_df_filtered.columns:
+            src_df_filtered = src_df_filtered.drop(columns=[drop_col])
+
+    src_df_filtered = src_df_filtered.reset_index(drop=True)
+
+    # Ensure chunk/file index columns are stored as integers (not floats).
+    # pandas may promote int columns to float when new columns are added via loc.
+    int_col_suffixes = ("/chunk_index", "/file_index")
+    int_col_names = ("episode_index", "length", "dataset_from_index", "dataset_to_index")
+    int_cols = [
+        c for c in src_df_filtered.columns
+        if c.endswith(int_col_suffixes) or c in int_col_names
+    ]
+    for col in int_cols:
+        src_df_filtered[col] = src_df_filtered[col].astype("Int64")
+
+    # Write to a single parquet file in the destination
+    dst_episodes_path = dst_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
+    dst_episodes_path.parent.mkdir(parents=True, exist_ok=True)
+    src_df_filtered.to_parquet(dst_episodes_path, index=False)
+
+    # Update info counters
+    total_frames = int(src_df_filtered["length"].sum())
+    dst_meta.info.update(
+        {
+            "total_episodes": len(episode_mapping),
+            "total_frames": total_frames,
+            "total_tasks": dst_meta.info.get("total_tasks", 0),
+            "splits": {"train": f"0:{len(episode_mapping)}"},
+        }
+    )
+    write_info(dst_meta.info, dst_meta.root)
+
+
+# ---------------------------------------------------------------------------
+# Public API: add_black_stream
+# ---------------------------------------------------------------------------
 
 def add_black_stream(
     dataset: LeRobotDataset,
@@ -2787,6 +3012,8 @@ def add_black_stream(
     pix_fmt: str = "yuv420p",
     g: int = 2,
     crf: int = 30,
+    episode_indices: list[int] | None = None,
+    append_to_dataset: LeRobotDataset | None = None,
 ) -> LeRobotDataset:
     """Add an all-black video stream to a LeRobotDataset.
 
@@ -2799,7 +3026,10 @@ def add_black_stream(
     yet available, or to provide a neutral reference channel that does not
     carry any visual information.
 
-    The new video files follow the same chunk/file layout as ``source_key``.
+    When *episode_indices* is given, only those episodes are processed.  When
+    *append_to_dataset* is provided, the processed episodes are **appended** to
+    that existing dataset instead of creating a new one, enabling an incremental
+    workflow where multiple runs accumulate results.
 
     Args:
         dataset: The source LeRobotDataset (must contain at least one video key).
@@ -2807,14 +3037,17 @@ def add_black_stream(
             stream (e.g. ``"observation.images.top"``).
         new_key: Name for the new black video stream
             (e.g. ``"observation.images.black_top"``).
-        output_dir: Directory for the new dataset.  If ``None``, defaults to
-            ``HF_LEROBOT_HOME / repo_id``.
-        repo_id: Repository ID for the new dataset.  If ``None``,
-            ``"_with_black"`` is appended to the original repo ID.
+        output_dir: Directory for the new dataset.  Ignored when *append_to_dataset*
+            is given.  If ``None``, defaults to ``HF_LEROBOT_HOME / repo_id``.
+        repo_id: Repository ID for the new dataset.  Ignored when *append_to_dataset*
+            is given.  If ``None``, ``"_with_black"`` is appended to the original repo ID.
         vcodec: Video codec for the black stream (default: ``"libsvtav1"``).
         pix_fmt: Pixel format for the black stream (default: ``"yuv420p"``).
         g: GOP size for encoding (default: ``2``).
         crf: Constant rate factor / quality setting (default: ``30``).
+        episode_indices: List of episode indices to process.  ``None`` means all.
+        append_to_dataset: When provided, episodes are appended to this existing
+            dataset.  *output_dir* and *repo_id* must be ``None``.
 
     Returns:
         New :class:`LeRobotDataset` with the black stream added.
@@ -2836,16 +3069,94 @@ def add_black_stream(
             "convert_image_to_video_dataset()."
         )
 
-    if new_key in dataset.meta.features:
-        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
+    if append_to_dataset is not None and (output_dir is not None or repo_id is not None):
+        raise ValueError(
+            "Cannot specify 'output_dir' or 'repo_id' together with 'append_to_dataset'."
+        )
 
     if dataset.meta.episodes is None:
         dataset.meta.episodes = load_episodes(dataset.root)
+
+    all_indices = list(range(dataset.meta.total_episodes))
+    processing_all = episode_indices is None or sorted(episode_indices) == all_indices
+
+    if episode_indices is None:
+        episode_indices = all_indices
+
+    valid_indices = set(all_indices)
+    invalid = set(episode_indices) - valid_indices
+    if invalid:
+        raise ValueError(f"Invalid episode indices: {invalid}")
+
+    # ---------------------------------------------------------------------------
+    # Append path: use add_frame / save_episode / finalize (requires video decode)
+    # ---------------------------------------------------------------------------
+    if append_to_dataset is not None:
+        return _add_black_stream_append(
+            dataset=dataset,
+            source_key=source_key,
+            new_key=new_key,
+            episode_indices=episode_indices,
+            append_to_dataset=append_to_dataset,
+            vcodec=vcodec,
+        )
+
+    if new_key in dataset.meta.features:
+        raise ValueError(f"Key '{new_key}' already exists in dataset features.")
 
     if repo_id is None:
         repo_id = f"{dataset.repo_id}_with_black"
     output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
 
+    # ---------------------------------------------------------------------------
+    # Fast path: all episodes, new dataset — copy files directly, no video decode
+    # ---------------------------------------------------------------------------
+    if processing_all:
+        return _add_black_stream_fast(
+            dataset=dataset,
+            source_key=source_key,
+            new_key=new_key,
+            output_dir=output_dir,
+            repo_id=repo_id,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+    # ---------------------------------------------------------------------------
+    # Filtered path: subset of episodes, new dataset — reindex using helpers
+    # ---------------------------------------------------------------------------
+    return _add_black_stream_filtered(
+        dataset=dataset,
+        source_key=source_key,
+        new_key=new_key,
+        episode_indices=episode_indices,
+        output_dir=output_dir,
+        repo_id=repo_id,
+        vcodec=vcodec,
+        pix_fmt=pix_fmt,
+        g=g,
+        crf=crf,
+    )
+
+
+def _add_black_stream_fast(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    output_dir: Path,
+    repo_id: str,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> LeRobotDataset:
+    """Fast path: copy all existing files and encode only the black stream.
+
+    Used when all episodes are requested and no append target is given.  Avoids
+    decoding any existing video — existing video files are copied bit-for-bit.
+    """
     # Build new features dict: copy source feature spec (shape/dtype) for the black stream
     source_feature = {
         "dtype": "video",
@@ -2966,6 +3277,247 @@ def add_black_stream(
 
     logging.info(f"Black stream '{new_key}' added. Dataset saved to: {output_dir}")
     return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+def _add_black_stream_filtered(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    episode_indices: list[int],
+    output_dir: Path,
+    repo_id: str,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+) -> LeRobotDataset:
+    """Filtered path: create a new dataset with only the selected episodes.
+
+    Uses the ``_copy_and_reindex_*`` helpers to avoid decoding existing video
+    streams — only the new black stream is encoded from scratch.
+    """
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+    new_features = dataset.meta.features.copy()
+    new_features[new_key] = source_feature
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Map old episode indices to sequential new indices
+    episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted(episode_indices))}
+
+    # Reindex existing video streams (copy or re-encode only selected episodes)
+    video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping, vcodec, pix_fmt)
+
+    # Reindex parquet data
+    data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
+
+    # Determine black frame dimensions
+    source_shape = dataset.meta.features[source_key]["shape"]
+    height, width = source_shape[0], source_shape[1]
+
+    # Group new episodes by their destination source_key chunk/file and sort by from_ts
+    new_file_groups: dict[tuple[int, int], list[tuple[float, int, int]]] = {}
+    for old_idx, new_idx in episode_mapping.items():
+        vmeta = video_metadata[new_idx]
+        chunk_idx = vmeta[f"videos/{source_key}/chunk_index"]
+        file_idx = vmeta[f"videos/{source_key}/file_index"]
+        from_ts = vmeta[f"videos/{source_key}/from_timestamp"]
+        new_file_groups.setdefault((chunk_idx, file_idx), []).append((from_ts, new_idx, old_idx))
+
+    fps = dataset.meta.fps
+    black_video_metadata: dict[int, dict] = {}
+
+    assert new_meta.video_path is not None
+    for (chunk_idx, file_idx), ep_entries in tqdm(
+        sorted(new_file_groups.items()), desc="Encoding black stream videos"
+    ):
+        # Sort entries by from_timestamp to maintain correct playback order
+        ep_entries_sorted = sorted(ep_entries, key=lambda x: x[0])
+        ordered_new_indices = [e[1] for e in ep_entries_sorted]
+        ordered_old_indices = [e[2] for e in ep_entries_sorted]
+
+        episode_lengths = {
+            new_idx: dataset.meta.episodes[old_idx]["length"]
+            for new_idx, old_idx in zip(ordered_new_indices, ordered_old_indices)
+        }
+
+        out_video_path = new_meta.root / new_meta.video_path.format(
+            video_key=new_key, chunk_index=chunk_idx, file_index=file_idx
+        )
+
+        episode_timestamps = _encode_black_video(
+            episodes=ordered_new_indices,
+            episode_lengths=episode_lengths,
+            width=width,
+            height=height,
+            output_path=out_video_path,
+            fps=fps,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+        )
+
+        for new_idx, (from_ts, to_ts) in zip(ordered_new_indices, episode_timestamps, strict=True):
+            black_video_metadata[new_idx] = {
+                f"videos/{new_key}/chunk_index": chunk_idx,
+                f"videos/{new_key}/file_index": file_idx,
+                f"videos/{new_key}/from_timestamp": from_ts,
+                f"videos/{new_key}/to_timestamp": to_ts,
+            }
+
+    # Merge existing video metadata with black stream metadata
+    merged_video_metadata: dict[int, dict] = {}
+    for new_idx in episode_mapping.values():
+        merged = {}
+        if new_idx in video_metadata:
+            merged.update(video_metadata[new_idx])
+        if new_idx in black_video_metadata:
+            merged.update(black_video_metadata[new_idx])
+        merged_video_metadata[new_idx] = merged
+
+    # Copy tasks and stats from source dataset
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+
+    _write_filtered_episodes_metadata(
+        src_dataset=dataset,
+        dst_meta=new_meta,
+        episode_mapping=episode_mapping,
+        data_metadata=data_metadata,
+        video_metadata=merged_video_metadata,
+    )
+
+    # Populate video codec/resolution info for the new key
+    first_black_path = new_meta.root / new_meta.video_path.format(
+        video_key=new_key, chunk_index=0, file_index=0
+    )
+    if first_black_path.exists():
+        new_meta.info["features"][new_key]["info"] = get_video_info(first_black_path)
+
+    # Propagate existing video feature info from source
+    for key in dataset.meta.video_keys:
+        if key in dataset.meta.features and dataset.meta.info["features"][key].get("info"):
+            new_meta.info["features"][key]["info"] = dataset.meta.info["features"][key]["info"]
+
+    write_info(new_meta.info, new_meta.root)
+
+    logging.info(f"Black stream '{new_key}' added to {len(episode_indices)} episodes. "
+                 f"Dataset saved to: {output_dir}")
+    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+
+
+def _add_black_stream_append(
+    dataset: LeRobotDataset,
+    source_key: str,
+    new_key: str,
+    episode_indices: list[int],
+    append_to_dataset: LeRobotDataset,
+    vcodec: str = "libsvtav1",
+) -> LeRobotDataset:
+    """Append path: add black stream episodes to an existing dataset.
+
+    Uses the ``add_frame`` / ``save_episode`` / ``finalize`` API, which requires
+    decoding the existing video streams (torchcodec or pyav backend).
+    """
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+    source_feature = {
+        "dtype": "video",
+        "shape": dataset.meta.features[source_key]["shape"],
+        "names": dataset.meta.features[source_key].get("names"),
+    }
+
+    target_user_features = {
+        k: v for k, v in append_to_dataset.meta.features.items() if k not in DEFAULT_FEATURES
+    }
+    expected = {**user_features, new_key: source_feature}
+    if set(expected.keys()) != set(target_user_features.keys()):
+        raise ValueError(
+            f"Feature mismatch between source+new_key and append target. "
+            f"Expected: {set(expected.keys())}, Target has: {set(target_user_features.keys())}"
+        )
+    if dataset.meta.fps != append_to_dataset.meta.fps:
+        raise ValueError(
+            f"FPS mismatch: source={dataset.meta.fps}, target={append_to_dataset.meta.fps}"
+        )
+
+    if append_to_dataset.latest_episode is not None:
+        append_to_dataset._writer_closed_for_reading = True
+    append_to_dataset.episode_buffer = append_to_dataset.create_episode_buffer()
+
+    # Build black frame once — shape is (H, W, C) float32 with all zeros.
+    source_shape = dataset.meta.features[source_key]["shape"]  # (H, W, C)
+    black_frame_hwc = np.zeros(source_shape, dtype=np.float32)
+
+    dataset._ensure_hf_dataset_loaded()
+
+    for ep_idx in tqdm(episode_indices, desc="Appending black stream"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        # Batch-decode all source video frames for this episode.
+        video_frames: dict[str, np.ndarray] = {}
+        for vid_key in dataset.meta.video_keys:
+            from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+            timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, vid_key)
+            frames_tensor = decode_video_frames(
+                video_path, timestamps, dataset.tolerance_s, dataset.video_backend
+            )
+            video_frames[vid_key] = frames_tensor.numpy()  # (N, C, H, W) float32
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            # Source video features (HWC float32)
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
+
+            # New black stream (all-zero frame repeated for every frame)
+            frame[new_key] = black_frame_hwc
+
+            # Image and numerical features
+            for key, feat in user_features.items():
+                if feat["dtype"] == "video":
+                    continue
+                elif feat["dtype"] == "image":
+                    frame[key] = (item[key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[key] = item[key].numpy()
+
+            append_to_dataset.add_frame(frame)
+
+        append_to_dataset.save_episode()
+
+    append_to_dataset.finalize()
+    append_to_dataset._ensure_hf_dataset_loaded()
+
+    logging.info(
+        f"Appended black stream episodes to dataset: "
+        f"{append_to_dataset.meta.total_episodes} episodes, "
+        f"{append_to_dataset.meta.total_frames} frames"
+    )
+    return append_to_dataset
 
 
 # ---------------------------------------------------------------------------

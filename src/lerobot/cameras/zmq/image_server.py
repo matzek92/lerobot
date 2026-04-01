@@ -38,6 +38,7 @@ import argparse
 import contextlib
 import json
 import logging
+import threading
 import time
 from collections import deque
 
@@ -74,6 +75,7 @@ class ImageServer:
         self.fps = config.get("fps", 30)
         self.show_preview = show_preview
         self.cameras: dict[str, OpenCVCamera] = {}
+        self.capture_threads: dict[str, CameraCaptureThread] = {}
 
         for name, cfg in config.get("cameras", {}).items():
             shape = cfg.get("shape", [480, 640])
