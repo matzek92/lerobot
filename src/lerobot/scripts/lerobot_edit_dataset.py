@@ -240,6 +240,39 @@ Show dataset information without feature details:
         --operation.type info \
         --operation.show_features false
 
+Copy all episodes from one dataset to a new dataset:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes
+
+Copy specific episodes only:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.episode_indices "[0, 2, 5]"
+
+Copy only specific camera streams:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.camera_keys "['observation.images.top']"
+
+Copy and rename camera streams:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.camera_key_mapping '{"observation.images.top": "observation.images.main"}'
+
+Copy episodes and append to an existing dataset:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --operation.type copy_episodes \
+        --operation.episode_indices "[0, 2, 5]" \
+        --operation.append_to_repo_id target/existing_dataset
 Recompute dataset statistics:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -277,6 +310,7 @@ from lerobot.datasets.dataset_tools import (
     add_sam2_stream,
     add_sam3_stream,
     convert_image_to_video_dataset,
+    copy_episodes,
     delete_episodes,
     merge_datasets,
     modify_tasks,
@@ -323,6 +357,27 @@ class SplitEpisodesConfig(OperationConfig):
 @dataclass
 class DeleteEpisodesConfig(OperationConfig):
     episode_indices: list[int] | None = None
+
+
+@OperationConfig.register_subclass("copy_episodes")
+@dataclass
+class CopyEpisodesConfig(OperationConfig):
+    """Configuration for copying episodes from one dataset to another.
+
+    All non-camera features (e.g. action, observation.state) are always copied.
+    Use *camera_keys* to restrict which camera/image streams are included, and
+    *camera_key_mapping* to rename them in the target dataset.
+    """
+
+    # Episode indices to copy. None = copy all episodes.
+    episode_indices: list[int] | None = None
+    # Camera/image stream keys to include. None = include all camera streams.
+    camera_keys: list[str] | None = None
+    # Optional dict mapping source camera key names to target camera key names.
+    camera_key_mapping: dict[str, str] | None = None
+    # When set, copied episodes are appended to this existing repo instead of
+    # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
+    append_to_repo_id: str | None = None
 
 
 @OperationConfig.register_subclass("split")
@@ -564,6 +619,61 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_copy_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, CopyEpisodesConfig):
+        raise ValueError("Operation config must be CopyEpisodesConfig")
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Copying episodes from {cfg.repo_id} and appending to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = copy_episodes(
+            src_dataset=dataset,
+            episode_indices=cfg.operation.episode_indices,
+            camera_keys=cfg.operation.camera_keys,
+            camera_key_mapping=cfg.operation.camera_key_mapping,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        logging.info(f"Copying episodes from {cfg.repo_id} to {output_repo_id}")
+        result_dataset = copy_episodes(
+            src_dataset=dataset,
+            episode_indices=cfg.operation.episode_indices,
+            camera_keys=cfg.operation.camera_keys,
+            camera_key_mapping=cfg.operation.camera_key_mapping,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
 
 
 def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
@@ -1364,6 +1474,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "copy_episodes":
+        handle_copy_episodes(cfg)
     elif operation_type == "trim_episodes":
         handle_trim_episodes(cfg)
     elif operation_type == "split_episodes":
