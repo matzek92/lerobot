@@ -233,6 +233,9 @@ class DatasetRecordConfig:
     private: bool = False
     # Add tags to your dataset on the hub.
     tags: list[str] | None = None
+    # Use upload_large_folder (recommended for multi-camera datasets >1GB).
+    # Provides parallel uploads, resume capability, and better progress reporting.
+    upload_large_folder: bool = True
     # Number of subprocesses handling the saving of frames as PNG. Set to 0 to use threads only;
     # set to ≥1 to use subprocesses, each using threads to write images. The best number of processes
     # and threads depends on your system. We recommend 4 threads per camera with 0 processes.
@@ -450,9 +453,8 @@ def record_loop(
             no_action_count += 1
             if no_action_count == 1 or no_action_count % 10 == 0:
                 logging.warning(
-                    "No policy or teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
+                    "⚠️  No policy or teleoperator provided; skipping action generation. "
+                    "This typically occurs during reset phases. Robot may not return to exact start position."
                 )
             continue
 
@@ -486,7 +488,8 @@ def record_loop(
         sleep_time_s: float = 1 / fps - dt_s
         if sleep_time_s < 0:
             logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                f"⚠️  Record loop running slower ({1 / dt_s:.1f} Hz) than target ({fps} Hz). "
+                f"Frames may be dropped and control unstable. Check: Camera FPS, Policy inference time, CPU usage."
             )
 
         precise_sleep(max(sleep_time_s, 0.0))
@@ -588,64 +591,69 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
-                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
+                "💡 Tip: Streaming encoding is disabled. Enable it for faster episode saving: "
+                "--dataset.streaming_encoding=true --dataset.encoder_threads=2. "
+                "See docs: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
-        with VideoEncodingManager(dataset):
-            recorded_episodes = 0
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                _notify_zmq_cameras(robot, "episode_start")
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_compressed_images=display_compressed_images,
-                )
-                _notify_zmq_cameras(robot, "episode_end")
+        try:
+            with VideoEncodingManager(dataset):
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    log_say(f"Recording episode {recorded_episodes + 1}/{cfg.dataset.num_episodes}", cfg.play_sounds)
+                    _notify_zmq_cameras(robot, "episode_start")
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
+                    )
+                    _notify_zmq_cameras(robot, "episode_end")
 
-                # --- Handle episode result ------------------------------------
-                # ESC during episode → save episode and stop recording entirely
-                if events["stop_recording"]:
-                    logging.info("ESC pressed during episode. Saving episode and stopping.")
-                    dataset.save_episode()
-                    recorded_episodes += 1
-                    break
-
-                # LEFT during episode → discard and go to reset/segmentation
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    # Fall through to reset phase (don't continue/skip)
-                else:
-                    # Normal end (RIGHT or time elapsed) → save episode
-                    dataset.save_episode()
-                    recorded_episodes += 1
-
-                    # Skip reset for the last episode
-                    is_last_episode = recorded_episodes >= cfg.dataset.num_episodes
-                    if is_last_episode or events["stop_recording"]:
+                    # --- Handle episode result ------------------------------------
+                    # ESC during episode → save episode and stop recording entirely
+                    if events["stop_recording"]:
+                        logging.info("⏹️  Recording stopped by user (ESC). Saving current episode and exiting.")
+                        dataset.save_episode()
+                        recorded_episodes += 1
                         break
 
-                log_say("Reset the environment", cfg.play_sounds)
-                logging.info(
-                    "Reset phase: move robot to start position. "
-                    "Press RIGHT ARROW to finish reset early."
-                )
+                    # LEFT during episode → discard and go to reset/segmentation
+                    if events["rerecord_episode"]:
+                        log_say("Re-recording episode (previous one discarded)", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        # Fall through to reset phase (don't continue/skip)
+                    else:
+                        # Normal end (RIGHT or time elapsed) → save episode
+                        dataset.save_episode()
+                        recorded_episodes += 1
 
+                        # Skip reset for the last episode
+                        is_last_episode = recorded_episodes >= cfg.dataset.num_episodes
+                        if is_last_episode or events["stop_recording"]:
+                            break
+
+                    # --- Step 1: Physical Environment Reset ---
+                    log_say("Resetting environment for next episode", cfg.play_sounds)
+                    logging.info(
+                        "Reset Phase: Move robot to start position. "
+                        "Press RIGHT ARROW to finish early, or ESC to stop recording."
+                    )
+
+                    # Run reset loop to physically reset the environment
                     record_loop(
                         robot=robot,
                         events=events,
@@ -659,55 +667,119 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                     )
 
-                # ESC during reset → stop recording (episode already saved above)
-                if events["stop_recording"]:
-                    logging.info("ESC pressed during reset. Stopping recording.")
-                    break
+                    # ESC during reset → stop recording (episode already saved above)
+                    if events["stop_recording"]:
+                        logging.info("⏹️  Recording stopped by user (ESC) during reset phase.")
+                        break
 
-                # --- Segmentation / guide frame phase -------------------------
-                # Suppress ZMQ camera timeout warnings during segmentation
-                _set_zmq_suppress_warnings(robot, True)
-                _notify_zmq_cameras(robot, "reset_done")
-                logging.info("Reset done. Sent reset_done event to image server.")
+                    # --- Step 2: Notify Camera Server & Allow Analysis ---
+                    # Reset is physically complete. Now trigger reset_done event to allow camera server
+                    # time to analyze the new scene and generate updated instructions
+                    _notify_zmq_cameras(robot, "reset_done")
+                    logging.info("🔄 Reset complete. Sent reset_done event to camera server for scene analysis...")
+                    
+                    # Suppress ZMQ camera timeout warnings during scene analysis phase
+                    _set_zmq_suppress_warnings(robot, True)
 
-                # --- Wait for user to press RIGHT ARROW to start next episode -
-                log_say("Press right arrow to start next episode", cfg.play_sounds)
-                logging.info(
-                    "Waiting for RIGHT ARROW to start next episode... "
-                    "(ESC to stop recording)"
-                )
-                events["exit_early"] = False
-                while not events["exit_early"] and not events["stop_recording"]:
-                    time.sleep(0.1)
+                    # --- Step 3: Wait for User to Start Next Episode ---
+                    log_say("Ready for next episode. Press right arrow to continue", cfg.play_sounds)
+                    logging.info(
+                        "Waiting for RIGHT ARROW to start episode {}/{} (ESC to stop). "
+                        "Camera server is analyzing the scene...".format(
+                            recorded_episodes + 1, cfg.dataset.num_episodes
+                        )
+                    )
+                    events["exit_early"] = False
+                    while not events["exit_early"] and not events["stop_recording"]:
+                        time.sleep(0.1)
 
-                _set_zmq_suppress_warnings(robot, False)
+                    _set_zmq_suppress_warnings(robot, False)
 
-                if events["stop_recording"]:
-                    logging.info("ESC pressed while waiting. Stopping recording.")
-                    break
+                    if events["stop_recording"]:
+                        logging.info("⏹️  Recording stopped by user (ESC) before starting next episode.")
+                        break
 
-                # Clear the exit_early flag so it doesn't interfere with next episode
-                events["exit_early"] = False
-                logging.info("Starting next episode...")
-    finally:
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
-        _notify_zmq_cameras(robot, "recording_stop")
+                    # Clear the exit_early flag so it doesn't interfere with next episode
+                    events["exit_early"] = False
+                    logging.info("Starting next episode...")
+            # VideoEncodingManager context exits here, ensuring encoding finishes before cleanup
+            logging.info("📹 Video encoding finalized.")
+        except Exception as e:
+            logging.error(f"Error during recording: {e}", exc_info=True)
+            raise
+        finally:
+            logging.info("🧹 Starting cleanup...")
+            log_say("Stop recording", cfg.play_sounds, blocking=True)
+            
+            # Notify ZMQ cameras before disconnecting
+            try:
+                _notify_zmq_cameras(robot, "recording_stop")
+                logging.info("✓ Sent recording_stop event to camera servers.")
+            except Exception as e:
+                logging.warning(f"Failed to notify camera servers: {e}")
 
-        if dataset:
-            dataset.finalize()
+            # Finalize dataset (must happen before disconnect)
+            if dataset:
+                try:
+                    logging.info("💾 Finalizing dataset...")
+                    dataset.finalize()
+                    logging.info("✓ Dataset finalized.")
+                except Exception as e:
+                    logging.error(f"Error finalizing dataset: {e}", exc_info=True)
 
-        if robot.is_connected:
-            robot.disconnect()
-        if teleop and teleop.is_connected:
-            teleop.disconnect()
+            # Disconnect robot and teleop
+            if robot.is_connected:
+                try:
+                    logging.info("Disconnecting robot...")
+                    robot.disconnect()
+                    logging.info("✓ Robot disconnected.")
+                except Exception as e:
+                    logging.warning(f"Error disconnecting robot: {e}")
+            
+            if teleop and teleop.is_connected:
+                try:
+                    logging.info("Disconnecting teleoperator...")
+                    teleop.disconnect()
+                    logging.info("✓ Teleoperator disconnected.")
+                except Exception as e:
+                    logging.warning(f"Error disconnecting teleoperator: {e}")
 
-        if not is_headless() and listener:
-            listener.stop()
+            # Stop listener
+            if not is_headless() and listener:
+                try:
+                    listener.stop()
+                    logging.info("✓ Keyboard listener stopped.")
+                except Exception as e:
+                    logging.warning(f"Error stopping listener: {e}")
 
-        if cfg.dataset.push_to_hub:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            # Push to hub
+            if cfg.dataset.push_to_hub:
+                try:
+                    upload_method = "upload_large_folder" if cfg.dataset.upload_large_folder else "upload_folder"
+                    logging.info(f"🚀 Pushing dataset to Hugging Face Hub (using {upload_method})...")
+                    logging.info("   (Multi-camera datasets can be several GB; expect minutes to hours)")
+                    logging.info("   Press Ctrl+C to skip; resume later with:")
+                    logging.info(f"   huggingface-cli upload-large-folder {cfg.dataset.repo_id} <local-path> --repo-type=dataset")
+                    dataset.push_to_hub(
+                        tags=cfg.dataset.tags,
+                        private=cfg.dataset.private,
+                        upload_large_folder=cfg.dataset.upload_large_folder,
+                    )
+                    logging.info("✓ Dataset pushed to hub.")
+                except KeyboardInterrupt:
+                    logging.warning("⚠️  Hub upload interrupted by user. Dataset is saved locally and partially uploaded.")
+                    logging.info("   Resume with: huggingface-cli upload-large-folder "
+                                f"{cfg.dataset.repo_id} <local-path> --repo-type=dataset")
+                except Exception as e:
+                    logging.error(f"Error pushing to hub: {e}", exc_info=True)
+                    logging.info("   Dataset is still saved locally and can be pushed later.")
+            else:
+                logging.info("ℹ️  Skipping hub upload (push_to_hub=false). Dataset saved locally.")
 
-        log_say("Exiting", cfg.play_sounds)
+            log_say("Exiting", cfg.play_sounds)
+    except Exception as e:
+        logging.error(f"Fatal error during recording initialization or execution: {e}", exc_info=True)
+        raise
     return dataset
 
 
