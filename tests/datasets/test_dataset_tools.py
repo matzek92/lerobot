@@ -24,13 +24,18 @@ import torch
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.datasets.dataset_tools import (
+    add_black_stream,
     add_features,
+    add_guide_stream,
+    copy_episodes,
     delete_episodes,
     merge_datasets,
     modify_features,
     modify_tasks,
     remove_feature,
     split_dataset,
+    split_episodes,
+    trim_episodes,
 )
 from lerobot.scripts.lerobot_edit_dataset import convert_image_to_video_dataset
 
@@ -141,6 +146,426 @@ def test_delete_empty_list(sample_dataset, tmp_path):
             sample_dataset,
             episode_indices=[],
             output_dir=tmp_path / "filtered",
+        )
+
+
+def _get_episode_frame_indices(dataset, ep_idx):
+    """Return the dataset-level indices for all frames belonging to ep_idx."""
+    return [
+        i
+        for i in range(len(dataset))
+        if int(dataset.hf_dataset["episode_index"][i].item()) == ep_idx
+    ]
+
+
+def test_trim_single_episode_start(sample_dataset, tmp_path):
+    """Test trimming frames from the start of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (3, 0)},
+        output_dir=output_dir,
+    )
+
+    # 5 episodes, episode 0 trimmed by 3 from start → 7 + 4*10 = 47 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 47
+    assert len(new_dataset) == 47
+
+    # Episode 0 should now have 7 frames
+    ep0_frames = _get_episode_frame_indices(new_dataset, 0)
+    assert len(ep0_frames) == 7
+
+    # frame_index for episode 0 should start at 0
+    frame_indices_ep0 = [
+        int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep0_frames
+    ]
+    assert frame_indices_ep0 == list(range(7))
+
+    # timestamp for episode 0 should start at 0.0
+    timestamps_ep0 = [
+        float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep0_frames
+    ]
+    assert timestamps_ep0[0] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_trim_single_episode_end(sample_dataset, tmp_path):
+    """Test trimming frames from the end of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={2: (0, 4)},
+        output_dir=output_dir,
+    )
+
+    # 5 episodes, episode 2 trimmed by 4 from end → 6 + 4*10 = 46 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 46
+
+
+def test_trim_single_episode_both_ends(sample_dataset, tmp_path):
+    """Test trimming frames from both ends of a single episode."""
+    output_dir = tmp_path / "trimmed"
+
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={1: (2, 3)},
+        output_dir=output_dir,
+    )
+
+    # 5 episodes, episode 1 trimmed by 5 total → 5 + 4*10 = 45 frames
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 45
+
+    # Episode 1 should have 5 frames
+    ep1_frames = _get_episode_frame_indices(new_dataset, 1)
+    assert len(ep1_frames) == 5
+
+
+def test_trim_multiple_episodes(sample_dataset, tmp_path):
+    """Test trimming multiple episodes at once."""
+    output_dir = tmp_path / "trimmed"
+
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (2, 1), 3: (1, 2)},
+        output_dir=output_dir,
+    )
+
+    # ep0: 10-3=7, ep3: 10-3=7, others: 10 each
+    # Total: 7 + 10 + 10 + 7 + 10 = 44
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 44
+
+
+def test_trim_all_episodes_same_spec(sample_dataset, tmp_path):
+    """Test trimming all episodes by the same amount."""
+    output_dir = tmp_path / "trimmed"
+
+    specs = {i: (1, 1) for i in range(5)}
+    new_dataset = trim_episodes(
+        sample_dataset,
+        episode_trim_specs=specs,
+        output_dir=output_dir,
+    )
+
+    # Each episode: 10 - 2 = 8 frames → 5 * 8 = 40
+    assert new_dataset.meta.total_episodes == 5
+    assert new_dataset.meta.total_frames == 40
+
+
+def test_trim_invalid_episode_index(sample_dataset, tmp_path):
+    """Test that invalid episode index raises error."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={99: (1, 0)},
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_too_many_frames(sample_dataset, tmp_path):
+    """Test that trimming too many frames raises an error."""
+    with pytest.raises(ValueError, match="Cannot trim"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (5, 5)},  # 5+5=10 >= episode length of 10
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_empty_specs(sample_dataset, tmp_path):
+    """Test that empty trim specs raises error."""
+    with pytest.raises(ValueError, match="No trim specifications provided"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={},
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_negative_values(sample_dataset, tmp_path):
+    """Test that negative trim values raise an error."""
+    with pytest.raises(ValueError, match="non-negative"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (-1, 0)},
+            output_dir=tmp_path / "trimmed",
+        )
+
+
+def test_trim_episodes_append_to_existing_dataset(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that trimmed episodes are correctly appended to an existing dataset."""
+    # Build a small target dataset with 2 episodes of 10 frames each.
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for ep_idx in range(2):
+        for _ in range(10):
+            frame = {
+                "action": np.random.randn(6).astype(np.float32),
+                "observation.state": np.random.randn(4).astype(np.float32),
+                "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+                "task": "task_target",
+            }
+            target_dataset.add_frame(frame)
+        target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # sample_dataset has 5 episodes × 10 frames. Trim episode 0 by [2, 3] → 5 frames.
+    # All 5 episodes are appended to target (which already has 2 episodes × 10 frames).
+    result = trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (2, 3)},
+        append_to_dataset=target_dataset,
+    )
+
+    # target had 2 eps × 10 = 20 frames; source contributes 5 + 4×10 = 45 frames
+    assert result is target_dataset
+    assert result.meta.total_episodes == 7   # 2 existing + 5 appended
+    assert result.meta.total_frames == 65    # 20 existing + 45 appended
+    assert len(result) == 65
+
+    # Episode indices should be contiguous 0..6
+    episode_indices = sorted({int(idx.item()) for idx in result.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(7))
+
+
+def test_trim_episodes_append_feature_mismatch(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that appending to a dataset with different features raises an error."""
+    different_features = {
+        "action": {"dtype": "float32", "shape": (3,), "names": None},  # different shape
+    }
+    other_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "other",
+        features=different_features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(3).astype(np.float32),
+            "task": "task_other",
+        }
+        other_dataset.add_frame(frame)
+    other_dataset.save_episode()
+    other_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Feature mismatch"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (1, 0)},
+            append_to_dataset=other_dataset,
+        )
+
+
+def test_trim_episodes_append_conflicts_with_output_dir(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test that specifying both append_to_dataset and output_dir raises an error."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target2",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "task_t",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Cannot specify 'output_dir' or 'repo_id' together with"):
+        trim_episodes(
+            sample_dataset,
+            episode_trim_specs={0: (1, 0)},
+            output_dir=tmp_path / "conflict",
+            append_to_dataset=target_dataset,
+        )
+
+
+def test_trim_episodes_append_incremental(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Test two sequential append operations (simulate incremental workflow)."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target_incr",
+        features=features,
+    )
+    # 1 episode × 10 frames as base
+    for _ in range(10):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "base_task",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # First incremental append: trim episode 0 (3 frames removed) → 7 frames appended
+    trim_episodes(
+        sample_dataset,
+        episode_trim_specs={0: (3, 0)},
+        append_to_dataset=target_dataset,
+    )
+    # After first append: 1 + 5 = 6 episodes, 10 + 7 + 4×10 = 57 frames
+    assert target_dataset.meta.total_episodes == 6
+    assert target_dataset.meta.total_frames == 57
+
+    # Second incremental append: trim episode 4 only (2+1=3 removed) → 7 frames appended
+    # Note: sample_dataset still has 5 episodes; episode 4 has 10 frames
+    trim_episodes(
+        sample_dataset,
+        episode_trim_specs={4: (2, 1)},
+        append_to_dataset=target_dataset,
+    )
+    # After second append: 6 + 5 = 11 episodes, 57 + 7 + 4×10 = 104 frames
+    assert target_dataset.meta.total_episodes == 11
+    assert target_dataset.meta.total_frames == 104
+
+
+def test_split_episodes_single(sample_dataset, tmp_path):
+    """Test splitting a single episode at a specified frame position."""
+    output_dir = tmp_path / "split_ep"
+
+    # Split episode 2 at frame 4 → first part: 4 frames, second part: 6 frames
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={2: 4},
+        output_dir=output_dir,
+    )
+
+    # 5 original episodes + 1 extra (one episode split into two) = 6 episodes
+    assert new_dataset.meta.total_episodes == 6
+    # Total frames unchanged: 50
+    assert new_dataset.meta.total_frames == 50
+    assert len(new_dataset) == 50
+
+    # Episode indices should be contiguous 0..5
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(6))
+
+    # Episode 2 (first part) should have 4 frames
+    ep2_frames = _get_episode_frame_indices(new_dataset, 2)
+    assert len(ep2_frames) == 4
+
+    # Episode 3 (second part, was the remainder of original episode 2) should have 6 frames
+    ep3_frames = _get_episode_frame_indices(new_dataset, 3)
+    assert len(ep3_frames) == 6
+
+    # frame_index for the first part should start at 0
+    frame_indices_ep2 = [int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep2_frames]
+    assert frame_indices_ep2 == list(range(4))
+
+    # frame_index for the second part should also start at 0
+    frame_indices_ep3 = [int(new_dataset.hf_dataset["frame_index"][i].item()) for i in ep3_frames]
+    assert frame_indices_ep3 == list(range(6))
+
+    # timestamp for the first part should start at 0.0
+    timestamps_ep2 = [float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep2_frames]
+    assert timestamps_ep2[0] == pytest.approx(0.0, abs=1e-4)
+
+    # timestamp for the second part should also start at 0.0
+    timestamps_ep3 = [float(new_dataset.hf_dataset["timestamp"][i].item()) for i in ep3_frames]
+    assert timestamps_ep3[0] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_split_episodes_multiple(sample_dataset, tmp_path):
+    """Test splitting multiple episodes at once."""
+    output_dir = tmp_path / "split_multi"
+
+    # Split episode 0 at frame 3 and episode 4 at frame 7
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={0: 3, 4: 7},
+        output_dir=output_dir,
+    )
+
+    # 5 original + 2 extra = 7 episodes
+    assert new_dataset.meta.total_episodes == 7
+    # Total frames unchanged: 50
+    assert new_dataset.meta.total_frames == 50
+
+    # Episode 0 → first part: 3 frames
+    ep0_frames = _get_episode_frame_indices(new_dataset, 0)
+    assert len(ep0_frames) == 3
+
+    # Episode 1 (was second part of original ep 0) → 7 frames
+    ep1_frames = _get_episode_frame_indices(new_dataset, 1)
+    assert len(ep1_frames) == 7
+
+
+def test_split_episodes_preserves_unchanged_episodes(sample_dataset, tmp_path):
+    """Test that episodes not listed in split specs are copied unchanged."""
+    output_dir = tmp_path / "split_unchanged"
+
+    new_dataset = split_episodes(
+        sample_dataset,
+        episode_split_specs={0: 5},
+        output_dir=output_dir,
+    )
+
+    # Episode 0 was split → episodes 1..5 are the original episodes 1..4 (shifted by 1)
+    # Each should have 10 frames
+    for ep_idx in range(2, 6):
+        ep_frames = _get_episode_frame_indices(new_dataset, ep_idx)
+        assert len(ep_frames) == 10, f"Episode {ep_idx} should have 10 frames, got {len(ep_frames)}"
+
+
+def test_split_episodes_invalid_index(sample_dataset, tmp_path):
+    """Test that an invalid episode index raises an error."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={99: 5},
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_split_frame_zero(sample_dataset, tmp_path):
+    """Test that split_frame=0 raises an error."""
+    with pytest.raises(ValueError, match="split_frame must be >= 1"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={0: 0},
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_split_frame_too_large(sample_dataset, tmp_path):
+    """Test that split_frame >= episode length raises an error."""
+    with pytest.raises(ValueError, match="out of range"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={0: 10},  # episode length is 10; 10 >= 10
+            output_dir=tmp_path / "split_err",
+        )
+
+
+def test_split_episodes_empty_specs(sample_dataset, tmp_path):
+    """Test that empty split specs raises an error."""
+    with pytest.raises(ValueError, match="No split specifications provided"):
+        split_episodes(
+            sample_dataset,
+            episode_split_specs={},
+            output_dir=tmp_path / "split_err",
         )
 
 
@@ -1323,3 +1748,485 @@ def test_convert_image_to_video_dataset_subset_episodes(tmp_path):
 
         if output_dir.exists():
             shutil.rmtree(output_dir)
+
+
+
+@pytest.fixture
+def video_dataset_for_guide(tmp_path, empty_lerobot_dataset_factory):
+    """Create a local video dataset for guide stream tests (no internet required)."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (64, 64, 3), "names": None},
+    }
+    img_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "img_ds",
+        features=features,
+    )
+    for ep_idx in range(3):
+        for _ in range(4):
+            img_dataset.add_frame(
+                {
+                    "action": np.random.randn(6).astype(np.float32),
+                    "observation.images.top": np.random.randint(
+                        0, 255, size=(64, 64, 3), dtype=np.uint8
+                    ),
+                    "task": "task_0",
+                }
+            )
+        img_dataset.save_episode()
+    img_dataset.finalize()
+
+    # Reload from disk so that meta.episodes is populated (finalize() writes to disk
+    # but does not refresh the in-memory meta.episodes).
+    img_dataset = LeRobotDataset(repo_id=img_dataset.repo_id, root=img_dataset.root)
+
+    video_dir = tmp_path / "vid_ds"
+    return convert_image_to_video_dataset(
+        dataset=img_dataset,
+        output_dir=video_dir,
+        repo_id="test/video_dataset",
+        num_workers=1,
+    )
+
+
+def test_add_guide_stream(video_dataset_for_guide, tmp_path):
+    """Test adding a guide stream to a video dataset."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_guide"
+    guide_dir = tmp_path / "guide_ds"
+
+    guide_dataset = add_guide_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=guide_dir,
+        repo_id="test/guide_dataset",
+    )
+
+    # New dataset must contain the guide stream as an additional video key
+    assert new_key in guide_dataset.meta.video_keys
+    assert len(guide_dataset.meta.video_keys) == len(video_dataset.meta.video_keys) + 1
+
+    # Episode and frame counts must be preserved
+    assert guide_dataset.meta.total_episodes == video_dataset.meta.total_episodes
+    assert guide_dataset.meta.total_frames == video_dataset.meta.total_frames
+
+    # A guide video file must exist for every episode
+    for ep_idx in range(guide_dataset.meta.total_episodes):
+        guide_path = guide_dataset.root / guide_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert guide_path.exists(), f"Guide video file should exist: {guide_path}"
+
+    # Feature shape must match the source camera
+    assert guide_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+    # All original video keys are still present
+    for key in video_dataset.meta.video_keys:
+        assert key in guide_dataset.meta.video_keys
+
+
+def test_add_guide_stream_invalid_source_key(video_dataset_for_guide, tmp_path):
+    """Test that add_guide_stream raises ValueError for a non-existent/non-video source key."""
+    with pytest.raises(ValueError, match="source_key"):
+        add_guide_stream(
+            dataset=video_dataset_for_guide,
+            source_key="nonexistent_key",
+            new_key="observation.images.guide",
+            output_dir=tmp_path / "out_err",
+            repo_id="test/guide_err",
+        )
+
+
+def test_add_guide_stream_duplicate_key(video_dataset_for_guide, tmp_path):
+    """Test that add_guide_stream raises ValueError when new_key already exists."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="already exists"):
+        add_guide_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=source_key,  # duplicate
+            output_dir=tmp_path / "out_dup",
+            repo_id="test/guide_dup",
+        )
+
+
+def test_add_black_stream(video_dataset_for_guide, tmp_path):
+    """Test adding an all-black stream to a video dataset."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+    black_dir = tmp_path / "black_ds"
+
+    black_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=black_dir,
+        repo_id="test/black_dataset",
+    )
+
+    # New dataset must contain the black stream as an additional video key
+    assert new_key in black_dataset.meta.video_keys
+    assert len(black_dataset.meta.video_keys) == len(video_dataset.meta.video_keys) + 1
+
+    # Episode and frame counts must be preserved
+    assert black_dataset.meta.total_episodes == video_dataset.meta.total_episodes
+    assert black_dataset.meta.total_frames == video_dataset.meta.total_frames
+
+    # A black video file must exist for every episode
+    for ep_idx in range(black_dataset.meta.total_episodes):
+        black_path = black_dataset.root / black_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert black_path.exists(), f"Black video file should exist: {black_path}"
+
+    # Feature shape must match the source camera
+    assert black_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+    # All original video keys are still present
+    for key in video_dataset.meta.video_keys:
+        assert key in black_dataset.meta.video_keys
+
+
+def test_add_black_stream_invalid_source_key(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError for a non-existent/non-video source key."""
+    with pytest.raises(ValueError, match="source_key"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key="nonexistent_key",
+            new_key="observation.images.black",
+            output_dir=tmp_path / "out_err",
+            repo_id="test/black_err",
+        )
+
+
+def test_add_black_stream_duplicate_key(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError when new_key already exists."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="already exists"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=source_key,  # duplicate
+            output_dir=tmp_path / "out_dup",
+            repo_id="test/black_dup",
+        )
+
+
+# ---------------------------------------------------------------------------
+# copy_episodes tests
+# ---------------------------------------------------------------------------
+
+
+def test_copy_episodes_all(sample_dataset, tmp_path):
+    """Copy all episodes to a new dataset — result is equivalent to source."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, output_dir=output_dir)
+
+    assert new_dataset.meta.total_episodes == sample_dataset.meta.total_episodes
+    assert new_dataset.meta.total_frames == sample_dataset.meta.total_frames
+    assert len(new_dataset) == len(sample_dataset)
+
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(sample_dataset.meta.total_episodes))
+
+
+def test_copy_episodes_subset(sample_dataset, tmp_path):
+    """Copy only a subset of episodes."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, episode_indices=[0, 2, 4], output_dir=output_dir)
+
+    assert new_dataset.meta.total_episodes == 3
+    assert new_dataset.meta.total_frames == 30
+    assert len(new_dataset) == 30
+
+    episode_indices = sorted({int(idx.item()) for idx in new_dataset.hf_dataset["episode_index"]})
+    assert episode_indices == [0, 1, 2]  # re-indexed starting from 0
+
+
+def test_copy_episodes_filter_camera_keys(sample_dataset, tmp_path):
+    """Copy only selected camera streams — excluded cameras are absent in target."""
+    output_dir = tmp_path / "copied"
+    # sample_dataset has 'observation.images.top' as the only image key
+    new_dataset = copy_episodes(
+        sample_dataset,
+        camera_keys=["observation.images.top"],
+        output_dir=output_dir,
+    )
+
+    assert "observation.images.top" in new_dataset.meta.features
+    assert "action" in new_dataset.meta.features
+    assert "observation.state" in new_dataset.meta.features
+    assert new_dataset.meta.total_frames == sample_dataset.meta.total_frames
+
+
+def test_copy_episodes_empty_camera_keys_excludes_all_cameras(sample_dataset, tmp_path):
+    """Passing an empty camera_keys list copies no camera streams."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(sample_dataset, camera_keys=[], output_dir=output_dir)
+
+    assert "observation.images.top" not in new_dataset.meta.features
+    # Non-camera features should still be present
+    assert "action" in new_dataset.meta.features
+    assert "observation.state" in new_dataset.meta.features
+
+
+def test_copy_episodes_camera_key_mapping(sample_dataset, tmp_path):
+    """Camera streams can be renamed via camera_key_mapping."""
+    output_dir = tmp_path / "copied"
+    new_dataset = copy_episodes(
+        sample_dataset,
+        camera_key_mapping={"observation.images.top": "observation.images.renamed"},
+        output_dir=output_dir,
+    )
+
+    assert "observation.images.renamed" in new_dataset.meta.features
+    assert "observation.images.top" not in new_dataset.meta.features
+    # Non-camera features unchanged
+    assert "action" in new_dataset.meta.features
+
+
+def test_copy_episodes_invalid_episode_index(sample_dataset, tmp_path):
+    """Invalid episode index raises ValueError."""
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        copy_episodes(
+            sample_dataset,
+            episode_indices=[99],
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_invalid_camera_key(sample_dataset, tmp_path):
+    """Camera key not present in source raises ValueError."""
+    with pytest.raises(ValueError, match="Camera keys not found"):
+        copy_episodes(
+            sample_dataset,
+            camera_keys=["observation.images.nonexistent"],
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_mapping_references_uncopied_key(sample_dataset, tmp_path):
+    """camera_key_mapping referencing a key not in camera_keys raises ValueError."""
+    with pytest.raises(ValueError, match="camera_key_mapping references keys not selected"):
+        copy_episodes(
+            sample_dataset,
+            camera_keys=[],  # no cameras selected
+            camera_key_mapping={"observation.images.top": "observation.images.renamed"},
+            output_dir=tmp_path / "copied",
+        )
+
+
+def test_copy_episodes_empty_list_raises(sample_dataset, tmp_path):
+    """Passing an empty episode_indices list raises ValueError."""
+    with pytest.raises(ValueError, match="No episodes to copy"):
+        copy_episodes(sample_dataset, episode_indices=[], output_dir=tmp_path / "copied")
+
+
+def test_copy_episodes_append_to_existing(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Episodes can be appended to an existing target dataset."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for ep_idx in range(2):
+        for _ in range(10):
+            frame = {
+                "action": np.random.randn(6).astype(np.float32),
+                "observation.state": np.random.randn(4).astype(np.float32),
+                "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+                "task": "task_target",
+            }
+            target_dataset.add_frame(frame)
+        target_dataset.save_episode()
+    target_dataset.finalize()
+
+    # Append 3 episodes from sample_dataset (each with 10 frames) to target.
+    result = copy_episodes(
+        sample_dataset,
+        episode_indices=[0, 1, 2],
+        append_to_dataset=target_dataset,
+    )
+
+    assert result is target_dataset
+    assert result.meta.total_episodes == 5   # 2 existing + 3 appended
+    assert result.meta.total_frames == 50    # 20 existing + 30 appended
+    assert len(result) == 50
+
+    episode_indices = sorted({int(idx.item()) for idx in result.hf_dataset["episode_index"]})
+    assert episode_indices == list(range(5))
+
+
+def test_copy_episodes_append_conflicts_with_output_dir(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Specifying both append_to_dataset and output_dir raises ValueError."""
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (224, 224, 3), "names": None},
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(6).astype(np.float32),
+            "observation.state": np.random.randn(4).astype(np.float32),
+            "observation.images.top": np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8),
+            "task": "task_target",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Cannot specify 'output_dir' or 'repo_id'"):
+        copy_episodes(
+            sample_dataset,
+            output_dir=tmp_path / "other",
+            append_to_dataset=target_dataset,
+        )
+
+
+def test_copy_episodes_append_feature_mismatch(sample_dataset, tmp_path, empty_lerobot_dataset_factory):
+    """Appending to a dataset with incompatible features raises ValueError."""
+    # Create target with a different feature set
+    features = {
+        "action": {"dtype": "float32", "shape": (3,), "names": None},  # different shape
+    }
+    target_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "target",
+        features=features,
+    )
+    for _ in range(5):
+        frame = {
+            "action": np.random.randn(3).astype(np.float32),
+            "task": "task_target",
+        }
+        target_dataset.add_frame(frame)
+    target_dataset.save_episode()
+    target_dataset.finalize()
+
+    with pytest.raises(ValueError, match="Feature mismatch"):
+        copy_episodes(sample_dataset, append_to_dataset=target_dataset)
+def test_add_black_stream_episode_indices(video_dataset_for_guide, tmp_path):
+    """Test adding a black stream for only a subset of episodes."""
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+    black_dir = tmp_path / "black_partial"
+
+    episode_indices = [0, 2]  # Skip episode 1
+    black_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=black_dir,
+        repo_id="test/black_partial",
+        episode_indices=episode_indices,
+    )
+
+    # Only the requested episodes should be present
+    assert black_dataset.meta.total_episodes == len(episode_indices)
+
+    # The black stream must exist as a video key
+    assert new_key in black_dataset.meta.video_keys
+
+    # A black video file must exist for every episode in the result
+    for ep_idx in range(black_dataset.meta.total_episodes):
+        black_path = black_dataset.root / black_dataset.meta.get_video_file_path(ep_idx, new_key)
+        assert black_path.exists(), f"Black video file should exist: {black_path}"
+
+    # Feature shape must match source
+    assert black_dataset.meta.features[new_key]["shape"] == video_dataset.meta.features[source_key]["shape"]
+
+
+def test_add_black_stream_episode_indices_invalid(video_dataset_for_guide, tmp_path):
+    """Test that add_black_stream raises ValueError for out-of-range episode indices."""
+    source_key = video_dataset_for_guide.meta.video_keys[0]
+    with pytest.raises(ValueError, match="Invalid episode indices"):
+        add_black_stream(
+            dataset=video_dataset_for_guide,
+            source_key=source_key,
+            new_key=f"{source_key}_black",
+            output_dir=tmp_path / "out_invalid",
+            repo_id="test/black_invalid",
+            episode_indices=[0, 99],  # 99 is out of range
+        )
+
+
+def test_add_black_stream_append_to_dataset(video_dataset_for_guide, tmp_path, empty_lerobot_dataset_factory):
+    """Test appending black stream episodes from one dataset to an existing target dataset."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+
+    # Create the initial target dataset with the first episode processed
+    target_dir = tmp_path / "target_ds"
+    target_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=target_dir,
+        repo_id="test/target_black",
+        episode_indices=[0],
+    )
+
+    initial_episodes = target_dataset.meta.total_episodes
+    initial_frames = target_dataset.meta.total_frames
+
+    # Reload target dataset from disk before appending
+    target_dataset = LeRobotDataset(repo_id=target_dataset.repo_id, root=target_dataset.root)
+
+    # Append the remaining episodes to the target dataset
+    result_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        episode_indices=[1, 2],
+        append_to_dataset=target_dataset,
+    )
+
+    # All episodes should now be in the target dataset
+    # The black stream must be present
+    assert new_key in result_dataset.meta.video_keys
+
+    # Episode count grew by 2
+    assert result_dataset.meta.total_episodes == initial_episodes + 2
+
+
+def test_add_black_stream_append_rejects_output_dir(video_dataset_for_guide, tmp_path, empty_lerobot_dataset_factory):
+    """Test that specifying both append_to_dataset and output_dir raises an error."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    video_dataset = video_dataset_for_guide
+    source_key = video_dataset.meta.video_keys[0]
+    new_key = f"{source_key}_black"
+
+    # Build a minimal target dataset to pass as append_to_dataset
+    target_dir = tmp_path / "target_ds"
+    target_dataset = add_black_stream(
+        dataset=video_dataset,
+        source_key=source_key,
+        new_key=new_key,
+        output_dir=target_dir,
+        repo_id="test/target_black",
+        episode_indices=[0],
+    )
+    target_dataset = LeRobotDataset(repo_id=target_dataset.repo_id, root=target_dataset.root)
+
+    with pytest.raises(ValueError, match="Cannot specify"):
+        add_black_stream(
+            dataset=video_dataset,
+            source_key=source_key,
+            new_key=new_key,
+            output_dir=tmp_path / "conflicting_dir",
+            append_to_dataset=target_dataset,
+        )
+

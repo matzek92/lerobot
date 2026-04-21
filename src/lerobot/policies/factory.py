@@ -22,15 +22,33 @@ from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
 
-if TYPE_CHECKING:
-    from lerobot.datasets import LeRobotDatasetMetadata
 
-from lerobot.configs import FeatureType, PreTrainedConfig
-from lerobot.envs import EnvConfig, env_to_policy_features
-from lerobot.processor import (
-    AbsoluteActionsProcessorStep,
-    PolicyProcessorPipeline,
-    RelativeActionsProcessorStep,
+
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.feature_utils import dataset_to_policy_features
+from lerobot.envs.configs import EnvConfig
+from lerobot.envs.utils import env_to_policy_features
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.cnn_bc.configuration_cnn_bc import CNNBCConfig
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
+from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.sac.configuration_sac import SACConfig
+from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.sarm.configuration_sarm import SARMConfig
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
+from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+from lerobot.processor import PolicyProcessorPipeline, AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+from lerobot.processor.converters import (
     batch_to_transition,
     policy_action_to_transition,
     transition_to_batch,
@@ -88,7 +106,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     at once, improving startup time and reducing dependencies.
 
     Args:
-        name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
+        name: The name of the policy. Supported names are "tdmpc", "diffusion", "act", "cnn_bc",
             "multi_task_dit", "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
     Returns:
         The policy class corresponding to the given name.
@@ -108,6 +126,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "cnn_bc":
+        from lerobot.policies.cnn_bc.modeling_cnn_bc import CNNBCPolicy
+
+        return CNNBCPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -188,6 +210,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "cnn_bc":
+        return CNNBCConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":

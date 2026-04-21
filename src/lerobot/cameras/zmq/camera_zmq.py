@@ -15,12 +15,28 @@
 # limitations under the License.
 
 """
-ZMQCamera - Captures frames from remote cameras via ZeroMQ using JSON protocol in the
-following format:
-    {
-        "timestamps": {"camera_name": float},
-        "images": {"camera_name": "<base64-jpeg>"}
-    }
+ZMQCamera - Captures frames from remote cameras via ZeroMQ.
+
+Supports two protocol versions:
+
+**Protocol v2 (multipart binary – default):**
+  The server sends a multipart ZMQ message per tick::
+
+    Part 0  – UTF-8 JSON metadata:
+                { "timestamps": {"cam": float},
+                  "cameras": ["cam1", "cam2", ...],
+                  "encoding": "jpeg",
+                  "protocol_version": 2 }
+    Parts 1..N – raw JPEG bytes for each camera listed in ``cameras``
+
+**Legacy protocol v1 (JSON / base64 – fallback):**
+  The server sends a single-part string message::
+
+    { "timestamps": {"cam": float},
+      "images":     {"cam": "<base64-jpeg>"} }
+
+The client auto-detects the protocol by checking whether the received multipart
+message contains more than one part.
 """
 
 import base64
@@ -56,8 +72,11 @@ class ZMQCamera(Camera):
     Manages camera interactions via ZeroMQ for receiving frames from a remote server.
 
     This class connects to a ZMQ Publisher, subscribes to frame topics, and decodes
-    incoming JSON messages containing Base64 encoded images. It supports both
+    incoming multipart messages containing raw JPEG image bytes. It supports both
     synchronous and asynchronous frame reading patterns.
+
+    The new protocol (v2) uses ``send_multipart`` / ``recv_multipart`` with binary
+    JPEG payloads. The legacy JSON/base64 protocol (v1) is supported as a fallback.
 
     Example usage:
         ```python
@@ -94,7 +113,10 @@ class ZMQCamera(Camera):
         # ZMQ Context and Socket
         self.context: zmq.Context | None = None
         self.socket: zmq.Socket | None = None
+        self.event_socket: zmq.Socket | None = None
+        self.features_socket: zmq.Socket | None = None
         self._connected = False
+        self.suppress_warnings = False
 
         # Threading resources
         self.thread: Thread | None = None
@@ -128,9 +150,29 @@ class ZMQCamera(Camera):
             self.socket = self.context.socket(zmq.SUB)
             self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
             self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            self.socket.setsockopt(zmq.CONFLATE, True)
+            # NOTE: CONFLATE does NOT work with multipart messages!
+            # It can cause incomplete messages where parts get mixed up.
+            # self.socket.setsockopt(zmq.CONFLATE, True)
             self.socket.connect(f"tcp://{self.server_address}:{self.port}")
             self._connected = True
+            
+            # Important: Give SUB socket time to establish connection with PUB
+            # Without this, early frames may be lost ("slow joiner" problem)
+            time.sleep(0.1)
+
+            # Set up event notification socket if event_port is configured
+            if self.config.event_port is not None:
+                self.event_socket = self.context.socket(zmq.PUSH)
+                self.event_socket.setsockopt(zmq.LINGER, 0)
+                self.event_socket.connect(f"tcp://{self.server_address}:{self.config.event_port}")
+                logger.info(f"{self} event notifications enabled on port {self.config.event_port}")
+
+            # Set up features socket if features_port is configured
+            if self.config.features_port is not None:
+                self.features_socket = self.context.socket(zmq.PUSH)
+                self.features_socket.setsockopt(zmq.LINGER, 0)
+                self.features_socket.connect(f"tcp://{self.server_address}:{self.config.features_port}")
+                logger.info(f"{self} features stream enabled on port {self.config.features_port}")
 
             # Auto-detect resolution if not provided
             if self.width is None or self.height is None:
@@ -162,6 +204,12 @@ class ZMQCamera(Camera):
     def _cleanup(self):
         """Clean up ZMQ resources."""
         self._connected = False
+        if self.features_socket:
+            self.features_socket.close()
+            self.features_socket = None
+        if self.event_socket:
+            self.event_socket.close()
+            self.event_socket = None
         if self.socket:
             self.socket.close()
             self.socket = None
@@ -176,37 +224,135 @@ class ZMQCamera(Camera):
         """
         raise NotImplementedError("Camera detection is not implemented for ZMQ cameras.")
 
+    def send_event(self, event_type: str) -> None:
+        """Send a recording event notification to the camera server.
+
+        Sends a JSON message with the event type and current timestamp to the camera server
+        via the ZMQ PUSH socket. Only active when `event_port` is configured.
+
+        Args:
+            event_type (str): The event type, e.g. ``"episode_start"``, ``"episode_end"``,
+                ``"reset_done"``.
+        """
+        if self.event_socket is None:
+            return
+        try:
+            import zmq
+
+            message = json.dumps({"event": event_type, "timestamp": time.time()})
+            self.event_socket.send_string(message, zmq.NOBLOCK)
+            logger.debug(f"{self} sent event: {event_type}")
+        except Exception as e:
+            logger.warning(f"{self} failed to send event '{event_type}': {e}")
+
+    def send_features(self, features: dict) -> None:
+        """Send robot features and sensor readings to the camera server.
+
+        Sends a JSON message containing robot features (e.g. joint positions,
+        velocities, sensor readings) to the camera server via the ZMQ PUSH socket.
+        The server can use these features for camera image preprocessing. Only active
+        when ``features_port`` is configured.
+
+        Args:
+            features (dict): Dictionary of robot features and sensor readings, e.g.
+                ``{"joint_positions": [...], "timestamp": 1234.5}``.
+        """
+        if self.features_socket is None:
+            return
+        try:
+            import zmq
+
+            message = json.dumps({"features": features, "timestamp": time.time()})
+            self.features_socket.send_string(message, zmq.NOBLOCK)
+            logger.debug(f"{self} sent features")
+        except Exception as e:
+            logger.warning(f"{self} failed to send features: {e}")
+
     def _read_from_hardware(self) -> NDArray[Any]:
         """
         Reads a single frame directly from the ZMQ socket.
+
+        Supports both protocol v2 (multipart binary JPEG) and the legacy v1
+        (single-part JSON / base64) format.  Protocol is auto-detected: if the
+        received message contains more than one part it is treated as v2;
+        otherwise the single part is parsed as legacy JSON.
         """
         if not self.is_connected or self.socket is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         try:
-            message = self.socket.recv_string()
-        except zmq.Again as e:
-            raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
+            parts = self.socket.recv_multipart()
+        except Exception as e:
+            # zmq is lazy-imported in connect(), so check by name to avoid a top-level import
+            if type(e).__name__ == "Again":
+                raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
+            raise
 
-        # Decode JSON message
-        data = json.loads(message)
+        # Drain buffer: keep only the latest complete multipart message
+        # This ensures we don't have stale frames accumulating
+        while True:
+            try:
+                import zmq
+                newer = self.socket.recv_multipart(zmq.NOBLOCK)
+                parts = newer
+            except Exception as e:
+                if type(e).__name__ == "Again":
+                    break
+                # Other errors should be raised
+                raise
 
-        if "images" not in data:
-            raise RuntimeError(f"{self} invalid message: missing 'images' key")
+        if len(parts) > 1:
+            # Protocol v2: multipart binary JPEG
+            try:
+                meta = json.loads(parts[0].decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                # Debug: log first few bytes to identify the issue
+                first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                logger.error(
+                    f"{self} failed to decode metadata as JSON. "
+                    f"First bytes: {first_bytes.hex()}, "
+                    f"Parts count: {len(parts)}, "
+                    f"Error: {e}"
+                )
+                raise RuntimeError(f"{self} received invalid metadata format") from e
+            cameras = meta.get("cameras", [])
 
-        images = data["images"]
+            if self.camera_name in cameras:
+                idx = cameras.index(self.camera_name)
+            elif cameras:
+                idx = 0
+            else:
+                raise RuntimeError(f"{self} no cameras in metadata")
 
-        # Get image by camera name or first available
-        if self.camera_name in images:
-            img_b64 = images[self.camera_name]
-        elif images:
-            img_b64 = next(iter(images.values()))
+            jpeg_bytes = parts[idx + 1]
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
         else:
-            raise RuntimeError(f"{self} no images in message")
+            # Legacy protocol v1: single-part JSON / base64
+            try:
+                data = json.loads(parts[0].decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                first_bytes = parts[0][:20] if len(parts[0]) >= 20 else parts[0]
+                logger.error(
+                    f"{self} failed to decode legacy message as JSON. "
+                    f"First bytes: {first_bytes.hex()}, "
+                    f"Error: {e}"
+                )
+                raise RuntimeError(f"{self} received invalid legacy message format") from e
 
-        # Decode base64 JPEG
-        img_bytes = base64.b64decode(img_b64)
-        frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if "images" not in data:
+                raise RuntimeError(f"{self} invalid message: missing 'images' key")
+
+            images = data["images"]
+
+            if self.camera_name in images:
+                img_b64 = images[self.camera_name]
+            elif images:
+                img_b64 = next(iter(images.values()))
+            else:
+                raise RuntimeError(f"{self} no images in message")
+
+            img_bytes = base64.b64decode(img_b64)
+            frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
 
         if frame is None:
             raise RuntimeError(f"{self} failed to decode image")
@@ -266,7 +412,8 @@ class ZMQCamera(Camera):
             except (TimeoutError, Exception) as e:
                 if failure_count <= 10:
                     failure_count += 1
-                    logger.warning(f"Read error: {e}")
+                    if not self.suppress_warnings:
+                        logger.warning(f"Read error: {e}")
                 else:
                     raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
 

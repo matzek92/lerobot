@@ -190,6 +190,7 @@ class TrainPipelineConfig(HubMixin):
             config_file = model_id
         else:
             try:
+                model_id = str(model_id).replace("\\", "/")  # Handle Windows paths for Hub download
                 config_file = hf_hub_download(
                     repo_id=model_id,
                     filename=TRAIN_CONFIG_NAME,

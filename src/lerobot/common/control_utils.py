@@ -162,9 +162,9 @@ def init_keyboard_listener():
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
             elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
+                print("Escape key pressed. Stopping data recording after current episode...")
                 events["stop_recording"] = True
-                events["exit_early"] = True
+                events["exit_early"] = True  # Also break out of any active loop
         except Exception as e:
             print(f"Error handling key press: {e}")
 

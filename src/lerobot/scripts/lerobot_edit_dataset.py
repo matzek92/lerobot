@@ -23,6 +23,7 @@ This script allows you to delete episodes, split datasets, merge datasets,
 remove features, modify tasks, recompute stats, and convert image datasets to video format.
 When new_repo_id is specified, creates a new dataset.
 
+
 Path semantics (v2): --root and --new_root are exact dataset folders containing
 meta/, data/, videos/. When omitted, defaults to $HF_LEROBOT_HOME/{repo_id}.
 
@@ -49,6 +50,46 @@ Delete episodes and save to a new dataset at a specific path and with a new repo
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
 
+Trim 5 frames from the start and 3 frames from the end of episode 0, and
+2 frames from the start of episode 2:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_trimmed \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [5, 3], "2": [2, 0]}'
+
+Trim episodes and use the visualization tool to find cut boundaries first:
+    # Step 1: Visualize episode 0 to find the frame indices to trim
+    lerobot-dataset-viz --repo-id lerobot/pusht --episode-index 0
+
+    # Step 2: Trim based on the identified frame indices
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_trimmed \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [10, 5]}'
+
+Append trimmed episodes from a source dataset to an existing target dataset (incremental workflow):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type trim_episodes \
+        --operation.episode_trim_specs '{"0": [5, 3]}' \
+        --operation.append_to_repo_id lerobot/pusht_existing
+
+Split an episode into two at a specific frame position:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_split \
+        --operation.type split_episodes \
+        --operation.episode_split_specs '{"0": 15}'
+
+Split multiple episodes at specific frame positions:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_split \
+        --operation.type split_episodes \
+        --operation.episode_split_specs '{"0": 15, "3": 20}'
+
 Split dataset by fractions (pusht_train, pusht_val):
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -73,6 +114,7 @@ Split into more than two splits:
         --repo_id lerobot/pusht \
         --operation.type split \
         --operation.splits '{"train": 0.6, "val": 0.2, "test": 0.2}'
+
 
 Merge multiple datasets:
     lerobot-edit-dataset \
@@ -99,6 +141,7 @@ Remove camera feature:
         --repo_id lerobot/pusht \
         --operation.type remove_feature \
         --operation.feature_names "['observation.image']"
+
 
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
     lerobot-edit-dataset \
@@ -138,6 +181,56 @@ Convert image dataset to video format and push to hub:
         --operation.type convert_image_to_video \
         --push_to_hub true
 
+Add a black stream (all-black frames with the same resolution as a source camera):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_black \
+        --operation.type add_black_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.black_top
+
+Add a black stream for specific episodes only:
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_black \
+        --operation.type add_black_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.black_top \
+        --operation.episode_indices "[0, 1, 2]"
+
+Append a black stream from one dataset to an existing target dataset (incremental workflow):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --operation.type add_black_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.black_top \
+        --operation.append_to_repo_id my_user/my_existing_dataset
+
+Add a guide stream (repeats the first frame of a camera throughout each episode):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_guide \
+        --operation.type add_guide_stream \
+        --operation.source_key observation.images.laptop \
+        --operation.new_key observation.images.guide_laptop
+
+Add a guide stream and push to hub:
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_guide \
+        --operation.type add_guide_stream \
+        --operation.source_key observation.images.top \
+        --operation.new_key observation.images.guide_top \
+        --push_to_hub true
+
+Add a segmented scene stream (interactive SAM2 segmentation of first frame per episode):
+    lerobot-edit-dataset \
+        --repo_id my_user/my_video_dataset \
+        --new_repo_id my_user/my_video_dataset_with_seg \
+        --operation.type add_sam2_initial_segment \
+        --operation.source_key observation.images.laptop \
+        --operation.new_key observation.images.segmented_laptop
+
 Show dataset information:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
@@ -150,6 +243,39 @@ Show dataset information without feature details:
         --operation.type info \
         --operation.show_features false
 
+Copy all episodes from one dataset to a new dataset:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes
+
+Copy specific episodes only:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.episode_indices "[0, 2, 5]"
+
+Copy only specific camera streams:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.camera_keys "['observation.images.top']"
+
+Copy and rename camera streams:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --new_repo_id target/new_dataset \
+        --operation.type copy_episodes \
+        --operation.camera_key_mapping '{"observation.images.top": "observation.images.main"}'
+
+Copy episodes and append to an existing dataset:
+    lerobot-edit-dataset \
+        --repo_id source/dataset \
+        --operation.type copy_episodes \
+        --operation.episode_indices "[0, 2, 5]" \
+        --operation.append_to_repo_id target/existing_dataset
 Recompute dataset statistics:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -180,15 +306,25 @@ from pathlib import Path
 import draccus
 
 from lerobot.configs import parser
-from lerobot.datasets import (
-    LeRobotDataset,
+from lerobot.datasets import LeRobotDataset
+
+from lerobot.datasets.dataset_tools import (
+    add_black_stream,
+    add_guide_stream,
+    add_sam2_initial_segment,
+    add_sam2_stream,
+    add_sam3_stream,
+
     convert_image_to_video_dataset,
+    copy_episodes,
     delete_episodes,
     merge_datasets,
     modify_tasks,
     recompute_stats,
     remove_feature,
     split_dataset,
+    split_episodes,
+    trim_episodes,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
@@ -201,10 +337,52 @@ class OperationConfig(draccus.ChoiceRegistry, abc.ABC):
         return self.get_choice_name(self.__class__)
 
 
+@OperationConfig.register_subclass("trim_episodes")
+@dataclass
+class TrimEpisodesConfig(OperationConfig):
+    # Keys are episode indices as strings because JSON/CLI argument parsing
+    # always produces string dict keys.  They are converted to int in
+    # handle_trim_episodes before being passed to trim_episodes().
+    episode_trim_specs: dict[str, tuple[int, int]] | None = None
+    # When set, trimmed episodes are appended to this existing repo instead of
+    # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
+    append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("split_episodes")
+@dataclass
+class SplitEpisodesConfig(OperationConfig):
+    # Keys are episode indices as strings because JSON/CLI argument parsing
+    # always produces string dict keys. They are converted to int in
+    # handle_split_episodes before being passed to split_episodes().
+    episode_split_specs: dict[str, int] | None = None
+
+
 @OperationConfig.register_subclass("delete_episodes")
 @dataclass
 class DeleteEpisodesConfig(OperationConfig):
     episode_indices: list[int] | None = None
+
+
+@OperationConfig.register_subclass("copy_episodes")
+@dataclass
+class CopyEpisodesConfig(OperationConfig):
+    """Configuration for copying episodes from one dataset to another.
+
+    All non-camera features (e.g. action, observation.state) are always copied.
+    Use *camera_keys* to restrict which camera/image streams are included, and
+    *camera_key_mapping* to rename them in the target dataset.
+    """
+
+    # Episode indices to copy. None = copy all episodes.
+    episode_indices: list[int] | None = None
+    # Camera/image stream keys to include. None = include all camera streams.
+    camera_keys: list[str] | None = None
+    # Optional dict mapping source camera key names to target camera key names.
+    camera_key_mapping: dict[str, str] | None = None
+    # When set, copied episodes are appended to this existing repo instead of
+    # creating a new dataset.  Mutually exclusive with EditDatasetConfig.new_repo_id.
+    append_to_repo_id: str | None = None
 
 
 @OperationConfig.register_subclass("split")
@@ -246,6 +424,116 @@ class ConvertImageToVideoConfig(OperationConfig):
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
+
+
+@OperationConfig.register_subclass("add_black_stream")
+@dataclass
+class AddBlackStreamConfig(OperationConfig):
+    """Configuration for adding an all-black video stream to a dataset.
+
+    The new stream contains only black (zero-valued) frames for every frame of
+    every episode.  Its spatial dimensions are taken from ``source_key`` so the
+    stream is resolution-compatible with the rest of the dataset.  Useful as a
+    placeholder when a second camera is not yet available.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    episode_indices: list[int] | None = None
+    append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("add_guide_stream")
+@dataclass
+class AddGuideStreamConfig(OperationConfig):
+    """Configuration for adding a guide video stream to a dataset.
+
+    The guide stream repeats the first frame of ``source_key`` throughout every
+    episode.  It is encoded as a regular video stream under ``new_key`` so that
+    any policy or visualisation tool can use it as a reference image.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    episode_indices: list[int] | None = None
+    append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("add_sam2_initial_segment")
+@dataclass
+class AddSam2InitialSegmentConfig(OperationConfig):
+    """Configuration for adding a segmented scene stream.
+
+    For each episode the first frame of ``source_key`` is shown in an
+    interactive OpenCV window where the user segments an object with SAM2.
+    The highlighted image is then repeated for the full episode duration,
+    just like :class:`AddGuideStreamConfig`.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    fade_pixels: int = 16
+    min_brightness: float = 0.0
+    episode_indices: list[int] | None = None
+    append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("add_sam2_stream")
+@dataclass
+class AddSam2StreamConfig(OperationConfig):
+    """Configuration for adding a SAM2 video-tracked segmentation stream.
+
+    For each episode the first frame of ``source_key`` is shown in an
+    interactive OpenCV window where the user selects an object.  SAM2's
+    video predictor then propagates the mask across **every** frame of
+    the episode.  The result is previewed in Rerun before the user
+    confirms or rejects it.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    fade_pixels: int = 16
+    min_brightness: float = 0.0
+    episode_indices: list[int] | None = None
+    append_to_repo_id: str | None = None
+
+
+@OperationConfig.register_subclass("add_sam3_stream")
+@dataclass
+class AddSam3StreamConfig(OperationConfig):
+    """Configuration for adding a SAM3 video-tracked segmentation stream.
+
+    For each episode the first frame of ``source_key`` is shown in an
+    interactive OpenCV window where the user selects an object.  SAM3's
+    video predictor then propagates the selected object across **every**
+    frame of the episode.  The result is previewed in Rerun before the
+    user confirms or rejects it.
+    """
+
+    source_key: str = ""
+    new_key: str = ""
+    vcodec: str = "libsvtav1"
+    pix_fmt: str = "yuv420p"
+    g: int = 2
+    crf: int = 30
+    fade_pixels: int = 16
+    min_brightness: float = 0.0
 
 
 @OperationConfig.register_subclass("recompute_stats")
@@ -336,6 +624,170 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_copy_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, CopyEpisodesConfig):
+        raise ValueError("Operation config must be CopyEpisodesConfig")
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Copying episodes from {cfg.repo_id} and appending to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = copy_episodes(
+            src_dataset=dataset,
+            episode_indices=cfg.operation.episode_indices,
+            camera_keys=cfg.operation.camera_keys,
+            camera_key_mapping=cfg.operation.camera_key_mapping,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        logging.info(f"Copying episodes from {cfg.repo_id} to {output_repo_id}")
+        result_dataset = copy_episodes(
+            src_dataset=dataset,
+            episode_indices=cfg.operation.episode_indices,
+            camera_keys=cfg.operation.camera_keys,
+            camera_key_mapping=cfg.operation.camera_key_mapping,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
+def handle_trim_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimEpisodesConfig):
+        raise ValueError("Operation config must be TrimEpisodesConfig")
+
+    if not cfg.operation.episode_trim_specs:
+        raise ValueError(
+            "episode_trim_specs must be specified for trim_episodes operation. "
+            "Provide a dict mapping episode indices to (trim_start, trim_end) tuples, e.g. "
+            '\'{"0": [5, 3], "2": [2, 0]}\''
+        )
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    # Convert string keys to int (CLI args come in as strings)
+    episode_trim_specs: dict[int, tuple[int, int]] = {}
+    for k, v in cfg.operation.episode_trim_specs.items():
+        episode_trim_specs[int(k)] = (int(v[0]), int(v[1]))
+
+    if cfg.operation.append_to_repo_id is not None:
+        # Append mode: load the target dataset and append trimmed episodes to it.
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending trimmed episodes from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            append_to_dataset=append_to_dataset,
+        )
+
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        # Normal mode: write trimmed output to a new (or in-place replaced) dataset.
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(f"Trimming episodes {list(episode_trim_specs.keys())} in {cfg.repo_id}")
+        result_dataset = trim_episodes(
+            dataset,
+            episode_trim_specs=episode_trim_specs,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+        )
+
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+
+
+def handle_split_episodes(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, SplitEpisodesConfig):
+        raise ValueError("Operation config must be SplitEpisodesConfig")
+
+    if not cfg.operation.episode_split_specs:
+        raise ValueError(
+            "episode_split_specs must be specified for split_episodes operation. "
+            "Provide a dict mapping episode indices to split frame positions, e.g. "
+            '\'{"0": 15, "3": 20}\''
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    # Convert string keys to int (CLI args come in as strings)
+    episode_split_specs: dict[int, int] = {int(k): int(v) for k, v in cfg.operation.episode_split_specs.items()}
+
+    logging.info(f"Splitting episodes {list(episode_split_specs.keys())} in {cfg.repo_id}")
+    result_dataset = split_episodes(
+        dataset,
+        episode_split_specs=episode_split_specs,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, Frames: {result_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
 
 
 def handle_split(cfg: EditDatasetConfig) -> None:
@@ -595,6 +1047,390 @@ def _get_dataset_size(repo_path):
     return total
 
 
+def handle_add_black_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddBlackStreamConfig):
+        raise ValueError("Operation config must be AddBlackStreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError("operation.source_key must be specified for add_black_stream operation")
+
+    if not cfg.operation.new_key:
+        raise ValueError("operation.new_key must be specified for add_black_stream operation")
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending black stream '{cfg.operation.new_key}' "
+            f"(resolution from '{cfg.operation.source_key}') "
+            f"from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = add_black_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            episode_indices=cfg.operation.episode_indices,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(
+            f"Adding black stream '{cfg.operation.new_key}' "
+            f"(resolution from '{cfg.operation.source_key}') to {cfg.repo_id}"
+        )
+        result_dataset = add_black_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            episode_indices=cfg.operation.episode_indices,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, "
+        f"Frames: {result_dataset.meta.total_frames}, "
+        f"Video keys: {result_dataset.meta.video_keys}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
+def handle_add_guide_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddGuideStreamConfig):
+        raise ValueError("Operation config must be AddGuideStreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError("operation.source_key must be specified for add_guide_stream operation")
+
+    if not cfg.operation.new_key:
+        raise ValueError("operation.new_key must be specified for add_guide_stream operation")
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending guide stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') "
+            f"from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = add_guide_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            episode_indices=cfg.operation.episode_indices,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(
+            f"Adding guide stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+        )
+        result_dataset = add_guide_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            episode_indices=cfg.operation.episode_indices,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, "
+        f"Frames: {result_dataset.meta.total_frames}, "
+        f"Video keys: {result_dataset.meta.video_keys}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
+def handle_add_sam2_initial_segment(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddSam2InitialSegmentConfig):
+        raise ValueError("Operation config must be AddSam2InitialSegmentConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError(
+            "operation.source_key must be specified for "
+            "add_sam2_initial_segment operation"
+        )
+    if not cfg.operation.new_key:
+        raise ValueError(
+            "operation.new_key must be specified for "
+            "add_sam2_initial_segment operation"
+        )
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending segmented stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') "
+            f"from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = add_sam2_initial_segment(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            fade_pixels=cfg.operation.fade_pixels,
+            min_brightness=cfg.operation.min_brightness,
+            episode_indices=cfg.operation.episode_indices,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(
+            f"Adding segmented stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+        )
+        result_dataset = add_sam2_initial_segment(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            fade_pixels=cfg.operation.fade_pixels,
+            min_brightness=cfg.operation.min_brightness,
+            episode_indices=cfg.operation.episode_indices,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, "
+        f"Frames: {result_dataset.meta.total_frames}, "
+        f"Video keys: {result_dataset.meta.video_keys}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
+def handle_add_sam2_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddSam2StreamConfig):
+        raise ValueError("Operation config must be AddSam2StreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError(
+            "operation.source_key must be specified for "
+            "add_sam2_stream operation"
+        )
+    if not cfg.operation.new_key:
+        raise ValueError(
+            "operation.new_key must be specified for "
+            "add_sam2_stream operation"
+        )
+
+    if cfg.operation.append_to_repo_id is not None and cfg.new_repo_id is not None:
+        raise ValueError(
+            "Cannot specify both 'operation.append_to_repo_id' and 'new_repo_id'. "
+            "Use 'operation.append_to_repo_id' to append to an existing dataset, "
+            "or 'new_repo_id' to create a fresh one."
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.operation.append_to_repo_id is not None:
+        append_root = Path(cfg.root) if cfg.root else HF_LEROBOT_HOME
+        append_to_dir = append_root / cfg.operation.append_to_repo_id
+        append_to_dataset = LeRobotDataset(cfg.operation.append_to_repo_id, root=append_to_dir)
+
+        logging.info(
+            f"Appending SAM2-tracked stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') "
+            f"from {cfg.repo_id} to {cfg.operation.append_to_repo_id}"
+        )
+        result_dataset = add_sam2_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            fade_pixels=cfg.operation.fade_pixels,
+            min_brightness=cfg.operation.min_brightness,
+            episode_indices=cfg.operation.episode_indices,
+            append_to_dataset=append_to_dataset,
+        )
+        logging.info(f"Dataset saved to {append_to_dir}")
+    else:
+        output_repo_id, output_dir = get_output_path(
+            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        )
+
+        if cfg.new_repo_id is None:
+            dataset.root = Path(str(dataset.root) + "_old")
+
+        logging.info(
+            f"Adding SAM2-tracked stream '{cfg.operation.new_key}' "
+            f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+        )
+        result_dataset = add_sam2_stream(
+            dataset=dataset,
+            source_key=cfg.operation.source_key,
+            new_key=cfg.operation.new_key,
+            output_dir=output_dir,
+            repo_id=output_repo_id,
+            vcodec=cfg.operation.vcodec,
+            pix_fmt=cfg.operation.pix_fmt,
+            g=cfg.operation.g,
+            crf=cfg.operation.crf,
+            fade_pixels=cfg.operation.fade_pixels,
+            min_brightness=cfg.operation.min_brightness,
+            episode_indices=cfg.operation.episode_indices,
+        )
+        logging.info(f"Dataset saved to {output_dir}")
+
+    logging.info(
+        f"Episodes: {result_dataset.meta.total_episodes}, "
+        f"Frames: {result_dataset.meta.total_frames}, "
+        f"Video keys: {result_dataset.meta.video_keys}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {result_dataset.repo_id}")
+        result_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
+def handle_add_sam3_stream(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, AddSam3StreamConfig):
+        raise ValueError("Operation config must be AddSam3StreamConfig")
+
+    if not cfg.operation.source_key:
+        raise ValueError(
+            "operation.source_key must be specified for "
+            "add_sam3_stream operation"
+        )
+    if not cfg.operation.new_key:
+        raise ValueError(
+            "operation.new_key must be specified for "
+            "add_sam3_stream operation"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Adding SAM3-tracked stream '{cfg.operation.new_key}' "
+        f"(sourced from '{cfg.operation.source_key}') to {cfg.repo_id}"
+    )
+    new_dataset = add_sam3_stream(
+        dataset=dataset,
+        source_key=cfg.operation.source_key,
+        new_key=cfg.operation.new_key,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+        g=cfg.operation.g,
+        crf=cfg.operation.crf,
+        fade_pixels=cfg.operation.fade_pixels,
+        min_brightness=cfg.operation.min_brightness,
+    )
+
+    logging.info(f"Dataset with SAM3 stream saved to {output_dir}")
+    logging.info(f"Video keys: {new_dataset.meta.video_keys}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
+        logging.info("Successfully pushed to hub!")
+
+
 def handle_info(cfg: EditDatasetConfig):
     if not isinstance(cfg.operation, InfoConfig):
         raise ValueError("Operation config must be InfoConfig")
@@ -643,6 +1479,12 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "copy_episodes":
+        handle_copy_episodes(cfg)
+    elif operation_type == "trim_episodes":
+        handle_trim_episodes(cfg)
+    elif operation_type == "split_episodes":
+        handle_split_episodes(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":
@@ -653,6 +1495,16 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "add_black_stream":
+        handle_add_black_stream(cfg)
+    elif operation_type == "add_guide_stream":
+        handle_add_guide_stream(cfg)
+    elif operation_type == "add_sam2_initial_segment":
+        handle_add_sam2_initial_segment(cfg)
+    elif operation_type == "add_sam2_stream":
+        handle_add_sam2_stream(cfg)
+    elif operation_type == "add_sam3_stream":
+        handle_add_sam3_stream(cfg)
     elif operation_type == "recompute_stats":
         handle_recompute_stats(cfg)
     elif operation_type == "info":

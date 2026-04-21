@@ -106,12 +106,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             )
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
+        # print(model_id)
         if os.path.isdir(model_id):
             print("Loading weights from local directory")
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
             policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
         else:
             try:
+                model_id = str(model_id).replace("\\", "/")  # Handle Windows paths for Hub download
                 model_file = hf_hub_download(
                     repo_id=model_id,
                     filename=SAFETENSORS_SINGLE_FILE,

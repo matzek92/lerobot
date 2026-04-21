@@ -20,6 +20,8 @@ import pytest
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.scripts.lerobot_edit_dataset import (
+    AddBlackStreamConfig,
+    AddGuideStreamConfig,
     ConvertImageToVideoConfig,
     DeleteEpisodesConfig,
     EditDatasetConfig,
@@ -29,6 +31,7 @@ from lerobot.scripts.lerobot_edit_dataset import (
     OperationConfig,
     RemoveFeatureConfig,
     SplitConfig,
+    SplitEpisodesConfig,
     _validate_config,
 )
 
@@ -46,10 +49,13 @@ class TestOperationTypeParsing:
         [
             ("delete_episodes", DeleteEpisodesConfig),
             ("split", SplitConfig),
+            ("split_episodes", SplitEpisodesConfig),
             ("merge", MergeConfig),
             ("remove_feature", RemoveFeatureConfig),
             ("modify_tasks", ModifyTasksConfig),
             ("convert_image_to_video", ConvertImageToVideoConfig),
+            ("add_black_stream", AddBlackStreamConfig),
+            ("add_guide_stream", AddGuideStreamConfig),
             ("info", InfoConfig),
         ],
     )
@@ -76,10 +82,13 @@ class TestOperationTypeParsing:
         [
             ("delete_episodes", DeleteEpisodesConfig),
             ("split", SplitConfig),
+            ("split_episodes", SplitEpisodesConfig),
             ("merge", MergeConfig),
             ("remove_feature", RemoveFeatureConfig),
             ("modify_tasks", ModifyTasksConfig),
             ("convert_image_to_video", ConvertImageToVideoConfig),
+            ("add_black_stream", AddBlackStreamConfig),
+            ("add_guide_stream", AddGuideStreamConfig),
             ("info", InfoConfig),
         ],
     )

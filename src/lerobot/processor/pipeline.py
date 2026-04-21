@@ -650,6 +650,7 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         else:
             # Hub: download specified config
             try:
+                model_id = str(model_id).replace("\\", "/")  # Handle Windows paths for Hub download
                 config_path = hf_hub_download(
                     repo_id=model_id,
                     filename=config_filename,
@@ -972,6 +973,7 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             state_path = str(base_path / state_filename)
         else:
             # Download from Hub
+            model_id = str(model_id).replace("\\", "/")  # Handle Windows paths for Hub download
             state_path = hf_hub_download(
                 repo_id=model_id,
                 filename=state_filename,

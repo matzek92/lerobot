@@ -27,6 +27,10 @@ Note: This script aims to visualize the data used to train the neural networks.
 lossy compression artifacts since these images have been decoded from compressed mp4 videos to
 save disk space. The compression factor applied has been tuned to not affect success rate.
 
+By default a step-info text is logged to the ``step_info`` entity for every frame so that the
+current episode/step/timestamp is clearly visible while scrubbing the timeline in Rerun.
+Use ``--no-show-step-index`` to disable this overlay.
+
 Examples:
 
 - Visualize data stored on a local machine:
@@ -97,6 +101,7 @@ def visualize_dataset(
     save: bool = False,
     output_dir: Path | None = None,
     display_compressed_images: bool = False,
+    show_step_index: bool = True,
     **kwargs,
 ) -> Path | None:
     if save:
@@ -146,6 +151,14 @@ def visualize_dataset(
         for i in range(len(batch["index"])):
             rr.set_time("frame_index", sequence=batch["index"][i].item() - first_index)
             rr.set_time("timestamp", timestamp=batch["timestamp"][i].item())
+
+            if show_step_index:
+                step = batch["frame_index"][i].item()
+                t = batch["timestamp"][i].item()
+                rr.log(
+                    "step_info",
+                    rr.TextLog(f"episode={episode_index} | step={step} | t={t:.3f}s"),
+                )
 
             # display each camera image
             for key in dataset.meta.camera_keys:
@@ -283,6 +296,17 @@ def main():
         "--display-compressed-images",
         action="store_true",
         help="If set, display compressed images in Rerun instead of uncompressed ones.",
+    )
+
+    parser.add_argument(
+        "--show-step-index",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Log a text overlay to the 'step_info' entity for every frame showing "
+            "'episode=N | step=M | t=T.Ts'. Useful for identifying start/end frames when "
+            "trimming. Pass --no-show-step-index to disable (default: enabled)."
+        ),
     )
 
     args = parser.parse_args()

@@ -30,6 +30,16 @@ class ZMQCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     timeout_ms: int = 5000
     warmup_s: int = 1
+    # Optional port for sending recording event notifications to the camera server.
+    # If set, ZMQCamera will push events (episode_start, episode_end, reset_done) to
+    # tcp://{server_address}:{event_port}. The ImageServer must be started with the
+    # same event_port to receive them.
+    event_port: int | None = None
+    # Optional port for sending robot features and sensor readings to the camera server.
+    # If set, ZMQCamera will push feature dicts to tcp://{server_address}:{features_port}.
+    # The ImageServer must be started with the same features_port to receive them and
+    # integrate them into camera image preprocessing.
+    features_port: int | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -42,3 +52,13 @@ class ZMQCameraConfig(CameraConfig):
 
         if self.port <= 0 or self.port > 65535:
             raise ValueError(f"`port` must be between 1 and 65535, but {self.port} is provided.")
+
+        if self.event_port is not None and (self.event_port <= 0 or self.event_port > 65535):
+            raise ValueError(
+                f"`event_port` must be between 1 and 65535, but {self.event_port} is provided."
+            )
+
+        if self.features_port is not None and (self.features_port <= 0 or self.features_port > 65535):
+            raise ValueError(
+                f"`features_port` must be between 1 and 65535, but {self.features_port} is provided."
+            )
