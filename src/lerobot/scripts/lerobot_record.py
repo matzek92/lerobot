@@ -591,9 +591,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     try:
         if cfg.resume:
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
+            # Derive a default root for resume() since it requires an explicit local directory.
+            # Use $HF_LEROBOT_HOME/{repo_id} (same convention as LeRobotDataset.create()).
+            resume_root = cfg.dataset.root
+            if resume_root is None:
+                from lerobot.utils.constants import HF_LEROBOT_HOME
+
+                resume_root = HF_LEROBOT_HOME / cfg.dataset.repo_id
+                logging.info(f"No --dataset.root provided for resume; using default: {resume_root}")
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
-                root=cfg.dataset.root,
+                root=resume_root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
                 streaming_encoding=cfg.dataset.streaming_encoding,

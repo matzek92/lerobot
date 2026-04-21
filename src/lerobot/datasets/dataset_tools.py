@@ -56,18 +56,15 @@ from .io_utils import (
 from .lerobot_dataset import LeRobotDataset
 from .utils import (
     DATA_DIR,
-    DEFAULT_FEATURES,
     EPISODES_DIR,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
-    DEFAULT_FEATURES,
-    EPISODES_DIR,
-    get_parquet_file_size_in_mb,
-    load_episodes,
-    update_chunk_file_indices,
+    update_chunk_file_indices
 )
+from lerobot.utils.constants import DEFAULT_FEATURES
+
 
 from .video_utils import (
     _get_codec_options,
