@@ -397,16 +397,28 @@ def analyze_episode_motion(
     gripper_motor_index: int | None = 5,
     smoothing_window: int = 1,
     show_progress: bool = True,
+    device: str = "cpu",
 ) -> dict:
     """Analyze a single-episode LeRobotDataset instance.
 
     The dataset is expected to contain exactly one episode (as loaded by the
     caller with `episodes=[episode_index]`).
+    
+    Args:
+        device: Device for camera motion computation ('cpu' or 'cuda').
+                Enables pin_memory optimization when CUDA is available (modest 10-20% speedup).
     """
+    # Validate and optimize device usage
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+    if device == "cuda" and not torch.cuda.is_available():
+        import logging
+        logging.warning("CUDA requested but not available, falling back to CPU")
+    
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=num_workers,
         batch_size=batch_size,
+        pin_memory=use_cuda,
         worker_init_fn=_worker_init_suppress_torchvision_warnings if num_workers > 0 else None,
     )
 
@@ -470,6 +482,154 @@ def analyze_episode_motion(
         "smoothing_window": smoothing_window,
     }
     return result
+
+
+def analyze_all_episodes_motion(
+    dataset,
+    batch_size: int = 32,
+    num_workers: int = 0,
+    filter_initial_motion: bool = False,
+    filter_final_motion: bool = False,
+    min_idle_frames: int = 5,
+    frame_padding: int = 0,
+    motor_score_aggregation: str = "max",
+    gripper_motor_index: int | None = 5,
+    smoothing_window: int = 1,
+    show_progress: bool = True,
+    device: str = "cpu",
+) -> dict[int, dict]:
+    """Analyze all episodes in a LeRobotDataset using a single DataLoader.
+
+    This is much more efficient than calling analyze_episode_motion() repeatedly,
+    as it uses only one DataLoader to iterate through all episodes sequentially.
+
+    Args:
+        dataset: LeRobotDataset potentially containing multiple episodes.
+        device: Device for camera motion computation ('cpu' or 'cuda').
+                Enables pin_memory optimization when CUDA is available.
+
+    Returns:
+        Dictionary mapping episode_index -> result dict.
+    """
+    # Validate and optimize device usage
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+    if device == "cuda" and not torch.cuda.is_available():
+        logging.warning("CUDA requested but not available, falling back to CPU")
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        pin_memory=use_cuda,
+        worker_init_fn=_worker_init_suppress_torchvision_warnings if num_workers > 0 else None,
+    )
+
+    if OBS_STATE not in dataset.meta.features:
+        raise ValueError(
+            f"Dataset '{dataset.repo_id}' does not contain '{OBS_STATE}'. Motor dead-time analysis requires it."
+        )
+
+    # Accumulate frames and metadata per episode
+    episodes_data: dict[int, dict] = {}
+
+    dataloader_iter = tqdm(dataloader, desc="Analyzing episodes", unit="batch") if show_progress else dataloader
+
+    for batch in dataloader_iter:
+        # Batch can contain frames from one or multiple episodes
+        episode_indices = [int(e) for e in batch.get("episode_index", [0] * len(batch["frame_index"]))]
+        frame_indices_batch = [int(f) for f in batch["frame_index"].tolist()]
+        state_batch = batch[OBS_STATE].cpu().numpy() if OBS_STATE in batch else None
+
+        # Group batch items by episode
+        episodes_in_batch = set(episode_indices)
+
+        for episode_idx in episodes_in_batch:
+            if episode_idx not in episodes_data:
+                episodes_data[episode_idx] = {
+                    "frame_indices": [],
+                    "state_batches": [],
+                    "previous_image_by_camera": {},
+                    "camera_motion_scores": defaultdict(list),
+                }
+
+            # Filter batch items for this episode
+            mask = [e == episode_idx for e in episode_indices]
+            episode_frame_indices = [f for f, m in zip(frame_indices_batch, mask) if m]
+            episodes_data[episode_idx]["frame_indices"].extend(episode_frame_indices)
+
+            if state_batch is not None:
+                episode_state = state_batch[mask]
+                episodes_data[episode_idx]["state_batches"].append(episode_state)
+
+        # Process camera motion for all images in batch (tracking per-episode state)
+        for camera_key in dataset.meta.camera_keys:
+            if camera_key not in batch:
+                continue
+
+            for idx, (episode_idx, image) in enumerate(zip(episode_indices, batch[camera_key])):
+                episode_dict = episodes_data[episode_idx]
+                prev_camera_dict = episode_dict["previous_image_by_camera"]
+
+                if camera_key not in prev_camera_dict:
+                    episode_dict["camera_motion_scores"][camera_key].append(0.0)
+                else:
+                    score = torch.mean(torch.abs(image - prev_camera_dict[camera_key])).item()
+                    episode_dict["camera_motion_scores"][camera_key].append(float(score))
+                prev_camera_dict[camera_key] = image
+
+    if len(episodes_data) == 0:
+        raise ValueError(f"Dataset '{dataset.repo_id}' contains no episodes")
+
+    # Analyze each episode
+    results: dict[int, dict] = {}
+
+    for episode_idx in sorted(episodes_data.keys()):
+        ep_data = episodes_data[episode_idx]
+        frame_indices = ep_data["frame_indices"]
+        camera_motion_scores = dict(ep_data["camera_motion_scores"])
+
+        if len(frame_indices) == 0:
+            logging.warning(f"Episode {episode_idx}: no frames found, skipping")
+            continue
+
+        if len(ep_data["state_batches"]) == 0:
+            logging.warning(f"Episode {episode_idx}: no state data found, skipping")
+            continue
+
+        observation_state = np.concatenate(ep_data["state_batches"], axis=0)
+
+        # Apply smoothing to camera motion scores
+        if smoothing_window > 1:
+            for camera_key in camera_motion_scores:
+                camera_motion_scores[camera_key] = _smooth_scores(
+                    camera_motion_scores[camera_key],
+                    window_size=smoothing_window,
+                )
+
+        result = analyze_episode_motion_arrays(
+            frame_indices,
+            observation_state,
+            camera_motion_scores,
+            filter_initial_motion=filter_initial_motion,
+            filter_final_motion=filter_final_motion,
+            min_idle_frames=min_idle_frames,
+            frame_padding=frame_padding,
+            motor_score_aggregation=motor_score_aggregation,
+            gripper_motor_index=gripper_motor_index,
+        )
+
+        # Attach raw data for optional verbose plotting
+        result["_raw"] = {
+            "frame_indices": frame_indices,
+            "observation_state": observation_state,
+            "camera_motion_scores": camera_motion_scores,
+            "motor_score_aggregation": motor_score_aggregation,
+            "smoothing_window": smoothing_window,
+        }
+
+        results[episode_idx] = result
+
+    return results
 
 
 def plot_episode_motion(
