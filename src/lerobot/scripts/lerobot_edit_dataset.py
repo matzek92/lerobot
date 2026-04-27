@@ -1255,7 +1255,10 @@ def handle_add_sam2_initial_segment(cfg: EditDatasetConfig) -> None:
         logging.info(f"Dataset saved to {append_to_dir}")
     else:
         output_repo_id, output_dir = get_output_path(
-            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+            cfg.repo_id,
+            new_repo_id=cfg.new_repo_id,
+            root=cfg.root,
+            new_root=cfg.new_root,
         )
 
         if cfg.new_repo_id is None:
@@ -1343,7 +1346,10 @@ def handle_add_sam2_stream(cfg: EditDatasetConfig) -> None:
         logging.info(f"Dataset saved to {append_to_dir}")
     else:
         output_repo_id, output_dir = get_output_path(
-            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+            cfg.repo_id,
+            new_repo_id=cfg.new_repo_id,
+            root=cfg.root,
+            new_root=cfg.new_root,
         )
 
         if cfg.new_repo_id is None:

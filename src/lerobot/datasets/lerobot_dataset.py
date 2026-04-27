@@ -321,6 +321,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.meta.fps
 
     @property
+    def video_backend(self) -> str:
+        """Video decoding backend configured for this dataset."""
+        return self._video_backend
+
+    @property
     def num_frames(self) -> int:
         """Number of frames in selected episodes."""
         # Check directly instead of using _ensure_reader(): in write-only mode
@@ -350,6 +355,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.reader.hf_dataset is None:
             self.reader.load_and_activate()
         return self.reader.hf_dataset
+
+    def _ensure_hf_dataset_loaded(self) -> None:
+        """Backward-compatible shim for older call sites expecting eager loading."""
+        _ = self.hf_dataset
 
     # ── Writer-delegated methods ──────────────────────────────────────
 
