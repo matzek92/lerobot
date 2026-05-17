@@ -1,0 +1,5 @@
+lerobot-calibrate --teleop.type=so101_leader --teleop.port=COM17 --teleop.id=black_leader
+
+
+
+python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=kiwi --robot.port=/dev/ttyACM0 --robot.cameras="{ wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, front_arm: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}, front_base: {type: opencv, index_or_path: /dev/video4, width: 640, height: 480, fps: 30} }"

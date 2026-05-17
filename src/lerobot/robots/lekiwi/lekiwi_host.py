@@ -70,6 +70,7 @@ def main(cfg: LeKiwiServerConfig):
 
     last_cmd_time = time.time()
     watchdog_active = False
+    no_command_warned = False
     logging.info("Waiting for commands...")
     try:
         # Business logic
@@ -83,9 +84,11 @@ def main(cfg: LeKiwiServerConfig):
                 _action_sent = robot.send_action(data)
                 last_cmd_time = time.time()
                 watchdog_active = False
+                no_command_warned = False
             except zmq.Again:
-                if not watchdog_active:
+                if not no_command_warned:
                     logging.warning("No command available")
+                    no_command_warned = True
             except Exception as e:
                 logging.error("Message fetching failed: %s", e)
 
