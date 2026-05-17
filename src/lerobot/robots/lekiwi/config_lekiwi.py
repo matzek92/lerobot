@@ -22,10 +22,10 @@ from ..config import RobotConfig
 
 def lekiwi_cameras_config() -> dict[str, CameraConfig]:
     return {
-        "front_arm": OpenCVCameraConfig(
+        "shoulder": OpenCVCameraConfig(
             index_or_path="/dev/video2", fps=30, width=640, height=480
         ),
-        "front_base": OpenCVCameraConfig(
+        "base": OpenCVCameraConfig(
             index_or_path="/dev/video4", fps=30, width=640, height=480
         ),
         "wrist": OpenCVCameraConfig(
