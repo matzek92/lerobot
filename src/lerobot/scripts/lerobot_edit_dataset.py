@@ -362,6 +362,8 @@ class SplitEpisodesConfig(OperationConfig):
 @dataclass
 class DeleteEpisodesConfig(OperationConfig):
     episode_indices: list[int] | None = None
+    # Video codec for re-encoded segments. None = preserve source dataset codec.
+    vcodec: str | None = None
 
 
 @OperationConfig.register_subclass("copy_episodes")
@@ -616,6 +618,7 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
         episode_indices=cfg.operation.episode_indices,
         output_dir=output_dir,
         repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
     )
 
     logging.info(f"Dataset saved to {output_dir}")

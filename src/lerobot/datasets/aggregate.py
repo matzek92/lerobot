@@ -74,12 +74,43 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             raise ValueError(
                 f"Same robot_type is expected, but got robot_type={meta.robot_type} instead of {robot_type}."
             )
-        if features != meta.features:
+        if not _features_compatible(features, meta.features):
             raise ValueError(
                 f"Same features is expected, but got features={meta.features} instead of {features}."
             )
 
     return fps, robot_type, features
+
+
+# Video info fields that are allowed to differ between merged datasets
+# (e.g. h264 vs av1 encoding). These do not affect data shape/semantics.
+_IGNORED_VIDEO_INFO_KEYS = {"video.codec", "video.pix_fmt"}
+
+
+def _features_compatible(features_a: dict, features_b: dict) -> bool:
+    """Compare two feature dicts, ignoring video codec / pixel format differences."""
+    if set(features_a.keys()) != set(features_b.keys()):
+        return False
+    for key, value_a in features_a.items():
+        value_b = features_b[key]
+        if not isinstance(value_a, dict) or not isinstance(value_b, dict):
+            if value_a != value_b:
+                return False
+            continue
+        # Compare top-level entries except "info"
+        keys_a = set(value_a.keys()) - {"info"}
+        keys_b = set(value_b.keys()) - {"info"}
+        if keys_a != keys_b:
+            return False
+        for k in keys_a:
+            if value_a[k] != value_b[k]:
+                return False
+        # Compare "info" while ignoring codec / pix_fmt
+        info_a = {k: v for k, v in (value_a.get("info") or {}).items() if k not in _IGNORED_VIDEO_INFO_KEYS}
+        info_b = {k: v for k, v in (value_b.get("info") or {}).items() if k not in _IGNORED_VIDEO_INFO_KEYS}
+        if info_a != info_b:
+            return False
+    return True
 
 
 def update_data_df(df, src_meta, dst_meta):

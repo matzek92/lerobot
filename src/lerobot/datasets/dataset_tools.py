@@ -102,6 +102,7 @@ def delete_episodes(
     episode_indices: list[int],
     output_dir: str | Path | None = None,
     repo_id: str | None = None,
+    vcodec: str | None = None,
 ) -> LeRobotDataset:
     """Delete episodes from a LeRobotDataset and create a new dataset.
 
@@ -110,6 +111,9 @@ def delete_episodes(
         episode_indices: List of episode indices to delete.
         output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
         repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
+        vcodec: Video codec used to re-encode the segments that contain a mix of
+            kept/deleted episodes. If ``None``, the codec is inferred from the
+            source dataset so the output dataset keeps the same codec.
     """
     if not episode_indices:
         raise ValueError("No episodes to delete")
@@ -142,7 +146,10 @@ def delete_episodes(
 
     video_metadata = None
     if dataset.meta.video_keys:
-        video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
+        resolved_vcodec = vcodec if vcodec is not None else _infer_source_vcodec(dataset)
+        video_metadata = _copy_and_reindex_videos(
+            dataset, new_meta, episode_mapping, vcodec=resolved_vcodec
+        )
 
     data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
 
@@ -1269,6 +1276,35 @@ def _keep_episodes_from_video_with_av(
     in_container.close()
 
 
+# Canonical codec name (as reported by PyAV / stored in meta info) -> FFmpeg encoder name.
+_CODEC_NAME_TO_ENCODER = {
+    "av1": "libsvtav1",
+    "libsvtav1": "libsvtav1",
+    "h264": "h264",
+    "libx264": "h264",
+    "hevc": "hevc",
+    "h265": "hevc",
+    "libx265": "hevc",
+}
+
+
+def _infer_source_vcodec(src_dataset: LeRobotDataset, default: str = "libsvtav1") -> str:
+    """Return the FFmpeg encoder name matching the codec of the source dataset's videos."""
+    for video_key in src_dataset.meta.video_keys:
+        feature = src_dataset.meta.features.get(video_key, {})
+        codec = (feature.get("info") or {}).get("video.codec")
+        if codec:
+            encoder = _CODEC_NAME_TO_ENCODER.get(codec.lower())
+            if encoder is not None:
+                logging.info(f"Preserving source video codec '{codec}' (encoder: {encoder})")
+                return encoder
+            logging.warning(
+                f"Unknown source codec '{codec}', falling back to default encoder '{default}'"
+            )
+            return default
+    return default
+
+
 def _copy_and_reindex_videos(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
@@ -1294,6 +1330,13 @@ def _copy_and_reindex_videos(
         src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
 
     episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in episode_mapping.values()}
+    # Track one destination video file per key whose info should be reflected in
+    # the dataset's meta/info.json. Re-encoded files are preferred over plain
+    # copies so that a codec change (e.g. via the ``vcodec`` argument of
+    # :func:`delete_episodes`) is propagated to
+    # ``info["features"][key]["info"]``.
+    refresh_video_info_paths: dict[str, Path] = {}
+    reencoded_video_keys: set[str] = set()
 
     for video_key in src_dataset.meta.video_keys:
         logging.info(f"Processing videos for {video_key}")
@@ -1334,6 +1377,11 @@ def _copy_and_reindex_videos(
                 )
                 dst_video_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(src_video_path, dst_video_path)
+
+                # Only set as the info source if no re-encoded file has been
+                # produced yet for this key (re-encoded files take precedence).
+                if video_key not in reencoded_video_keys:
+                    refresh_video_info_paths[video_key] = dst_video_path
 
                 for old_idx in episodes_in_file:
                     new_idx = episode_mapping[old_idx]
@@ -1382,6 +1430,11 @@ def _copy_and_reindex_videos(
                     pix_fmt,
                 )
 
+                # Prefer re-encoded files when refreshing metadata so the new
+                # codec / encoding settings are reflected in meta/info.json.
+                refresh_video_info_paths[video_key] = dst_video_path
+                reencoded_video_keys.add(video_key)
+
                 cumulative_ts = 0.0
                 for old_idx in sorted_keep_episodes:
                     new_idx = episode_mapping[old_idx]
@@ -1397,6 +1450,21 @@ def _copy_and_reindex_videos(
                     )
 
                     cumulative_ts += ep_duration
+
+    # Refresh per-video-key info from a representative destination file so that
+    # any change in encoding (e.g. a different ``vcodec``) is reflected in the
+    # dataset's meta/info.json that gets persisted by ``write_info`` further
+    # down the pipeline.
+    for video_key, dst_video_path in refresh_video_info_paths.items():
+        if video_key not in dst_meta.info.get("features", {}):
+            continue
+        try:
+            dst_meta.info["features"][video_key]["info"] = get_video_info(dst_video_path)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f"Failed to refresh video info for '{video_key}' from "
+                f"{dst_video_path}: {e}"
+            )
 
     return episodes_video_metadata
 
@@ -1453,18 +1521,26 @@ def _copy_and_reindex_episodes_metadata(
 
                     value = src_episode_full[key]
 
+                    is_image_like = "image" in feature_name
                     if feature_name in src_dataset.meta.features:
                         feature_dtype = src_dataset.meta.features[feature_name]["dtype"]
-                        if feature_dtype in ["image", "video"] and stat_name != "count":
-                            if isinstance(value, np.ndarray) and value.dtype == object:
-                                flat_values = []
-                                for item in value:
-                                    while isinstance(item, np.ndarray):
-                                        item = item.flatten()[0]
-                                    flat_values.append(item)
-                                value = np.array(flat_values, dtype=np.float64).reshape(3, 1, 1)
-                            elif isinstance(value, np.ndarray) and value.shape == (3,):
-                                value = value.reshape(3, 1, 1)
+                        if feature_dtype in ["image", "video"]:
+                            is_image_like = True
+
+                    if is_image_like and stat_name != "count":
+                        if isinstance(value, np.ndarray) and value.dtype == object:
+                            flat_values = []
+                            for item in value:
+                                while isinstance(item, np.ndarray):
+                                    item = item.flatten()[0]
+                                flat_values.append(item)
+                            value = np.array(flat_values, dtype=np.float64).reshape(3, 1, 1)
+                        else:
+                            arr = np.asarray(value, dtype=np.float64)
+                            if arr.size == 3:
+                                value = arr.reshape(3, 1, 1)
+                            else:
+                                value = arr
 
                     episode_stats[feature_name][stat_name] = value
 
