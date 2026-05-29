@@ -400,6 +400,11 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                 file_index=src_file_idx,
             )
 
+            # Check if the source video file exists
+            if not src_path.exists():
+                logging.warning(f"Skipping missing video file: {src_path}")
+                continue
+
             dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=chunk_idx,
@@ -501,6 +506,12 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
+        
+        # Check if the source data file exists
+        if not src_path.exists():
+            logging.warning(f"Skipping missing data file: {src_path}")
+            continue
+        
         if contains_images:
             # Use HuggingFace datasets to read source data to preserve image format
             src_ds = datasets.Dataset.from_parquet(str(src_path))
@@ -560,6 +571,12 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        
+        # Check if the file exists before trying to read it
+        if not src_path.exists():
+            logging.warning(f"Skipping missing metadata file: {src_path}")
+            continue
+        
         df = pd.read_parquet(src_path)
         df = update_meta_data(
             df,

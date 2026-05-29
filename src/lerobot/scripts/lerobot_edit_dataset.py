@@ -42,6 +42,25 @@ Delete episodes from a local dataset at a specific path:
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
 
+Resize all video streams of a dataset to 320x240:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_320x240 \
+        --operation.type resize_videos \
+        --operation.width 320 \
+        --operation.height 240
+
+Resize only selected camera streams and switch codec to h264:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_256 \
+        --new_root /path/to/pusht_256 \
+        --operation.type resize_videos \
+        --operation.width 256 \
+        --operation.height 256 \
+        --operation.video_keys "['observation.images.laptop']" \
+        --operation.vcodec h264
+
 Delete episodes and save to a new dataset at a specific path and with a new repo_id:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -141,6 +160,13 @@ Remove camera feature:
         --repo_id lerobot/pusht \
         --operation.type remove_feature \
         --operation.feature_names "['observation.image']"
+
+Rename feature keys (e.g. rename a camera stream):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_renamed \
+        --operation.type rename_features \
+        --operation.rename_map '{"observation.images.top": "observation.images.main"}'
 
 
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
@@ -322,6 +348,8 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     recompute_stats,
     remove_feature,
+    rename_features,
+    resize_videos,
     split_dataset,
     split_episodes,
     trim_episodes,
@@ -366,6 +394,28 @@ class DeleteEpisodesConfig(OperationConfig):
     vcodec: str | None = None
 
 
+@OperationConfig.register_subclass("resize_videos")
+@dataclass
+class ResizeVideosConfig(OperationConfig):
+    """Configuration for resizing video streams of a dataset.
+
+    Every targeted video file is decoded, resized frame-by-frame and re-encoded.
+    Non-targeted video keys are copied as-is. The feature ``shape`` and the
+    per-video entries in ``meta/info.json`` are updated to reflect the new
+    resolution and (if changed) codec.
+    """
+
+    # Target frame width in pixels (must be positive).
+    width: int = 0
+    # Target frame height in pixels (must be positive).
+    height: int = 0
+    # Optional list of video feature keys to resize. None = resize all.
+    video_keys: list[str] | None = None
+    # Video codec for re-encoding. None = preserve source dataset codec.
+    vcodec: str | None = None
+    pix_fmt: str = "yuv420p"
+
+
 @OperationConfig.register_subclass("copy_episodes")
 @dataclass
 class CopyEpisodesConfig(OperationConfig):
@@ -404,6 +454,20 @@ class MergeConfig(OperationConfig):
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("rename_features")
+@dataclass
+class RenameFeaturesConfig(OperationConfig):
+    """Configuration for renaming features of a dataset.
+
+    ``rename_map`` maps existing feature keys to their new names. Works for
+    state / action / image / video features. Required features (``timestamp``,
+    ``frame_index``, ``episode_index``, ``index``, ``task_index``) cannot be
+    renamed.
+    """
+
+    rename_map: dict[str, str] | None = None
 
 
 @OperationConfig.register_subclass("modify_tasks")
@@ -623,6 +687,53 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
 
     logging.info(f"Dataset saved to {output_dir}")
     logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_resize_videos(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ResizeVideosConfig):
+        raise ValueError("Operation config must be ResizeVideosConfig")
+
+    if cfg.operation.width <= 0 or cfg.operation.height <= 0:
+        raise ValueError(
+            "--operation.width and --operation.height must be positive integers "
+            f"(got {cfg.operation.width}x{cfg.operation.height})"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+
+    # In case of in-place modification, make the source point to a backup dir.
+    if output_dir == dataset.root:
+        dataset.root = dataset.root.with_name(dataset.root.name + "_old")
+
+    logging.info(
+        f"Resizing videos of {cfg.repo_id} to "
+        f"{cfg.operation.width}x{cfg.operation.height}"
+    )
+    new_dataset = resize_videos(
+        dataset,
+        width=cfg.operation.width,
+        height=cfg.operation.height,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        video_keys=cfg.operation.video_keys,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(
+        f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}"
+    )
 
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
@@ -904,6 +1015,46 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
 
 
+def handle_rename_features(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RenameFeaturesConfig):
+        raise ValueError("Operation config must be RenameFeaturesConfig")
+
+    if not cfg.operation.rename_map:
+        raise ValueError(
+            "--operation.rename_map must be a non-empty dict, e.g. "
+            "'{\"observation.images.top\": \"observation.images.main\"}'"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+
+    # In case of in-place modification, make the source point to a backup dir.
+    if output_dir == dataset.root:
+        dataset.root = dataset.root.with_name(dataset.root.name + "_old")
+
+    logging.info(
+        f"Renaming features {cfg.operation.rename_map} of {cfg.repo_id}"
+    )
+    new_dataset = rename_features(
+        dataset,
+        rename_map=cfg.operation.rename_map,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Features after rename: {list(new_dataset.meta.features.keys())}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
 def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, ModifyTasksConfig):
         raise ValueError("Operation config must be ModifyTasksConfig")
@@ -1093,7 +1244,10 @@ def handle_add_black_stream(cfg: EditDatasetConfig) -> None:
         logging.info(f"Dataset saved to {append_to_dir}")
     else:
         output_repo_id, output_dir = get_output_path(
-            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+            cfg.repo_id,
+            new_repo_id=cfg.new_repo_id,
+            root=cfg.root,
+            new_root=cfg.new_root,
         )
 
         if cfg.new_repo_id is None:
@@ -1172,7 +1326,10 @@ def handle_add_guide_stream(cfg: EditDatasetConfig) -> None:
         logging.info(f"Dataset saved to {append_to_dir}")
     else:
         output_repo_id, output_dir = get_output_path(
-            cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+            cfg.repo_id,
+            new_repo_id=cfg.new_repo_id,
+            root=cfg.root,
+            new_root=cfg.new_root,
         )
 
         if cfg.new_repo_id is None:
@@ -1488,6 +1645,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "resize_videos":
+        handle_resize_videos(cfg)
     elif operation_type == "copy_episodes":
         handle_copy_episodes(cfg)
     elif operation_type == "trim_episodes":
@@ -1500,6 +1659,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "rename_features":
+        handle_rename_features(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":

@@ -167,6 +167,112 @@ def delete_episodes(
     return new_dataset
 
 
+def resize_videos(
+    dataset: LeRobotDataset,
+    width: int,
+    height: int,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    video_keys: list[str] | None = None,
+    vcodec: str | None = None,
+    pix_fmt: str = "yuv420p",
+) -> LeRobotDataset:
+    """Create a new dataset with selected video streams resized to ``width`` x ``height``.
+
+    All episodes and non-video data are copied unchanged. For each targeted
+    video key, every video file is decoded, resized frame-by-frame and
+    re-encoded. Non-targeted video keys are copied as-is. The feature ``shape``
+    and the per-video entries in ``meta/info.json`` are updated to reflect the
+    new resolution and (if changed) codec.
+
+    Args:
+        dataset: The source :class:`LeRobotDataset`.
+        width: Target frame width in pixels (must be positive).
+        height: Target frame height in pixels (must be positive).
+        output_dir: Directory where the new dataset will be stored. Defaults to
+            ``$HF_LEROBOT_HOME/{repo_id}``.
+        repo_id: Repository identifier for the new dataset. Defaults to
+            ``f"{dataset.repo_id}_resized"``.
+        video_keys: Optional list of video feature keys to resize. ``None``
+            resizes all video keys in the source dataset.
+        vcodec: Video codec used for re-encoding. ``None`` preserves the codec
+            of the source dataset.
+        pix_fmt: Pixel format for the re-encoded videos.
+
+    Returns:
+        The newly created :class:`LeRobotDataset`.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"width and height must be positive, got {width}x{height}")
+    if not dataset.meta.video_keys:
+        raise ValueError("Source dataset has no video features to resize")
+
+    target_keys = list(video_keys) if video_keys is not None else list(dataset.meta.video_keys)
+    if not target_keys:
+        raise ValueError("No video keys selected for resizing")
+    invalid = set(target_keys) - set(dataset.meta.video_keys)
+    if invalid:
+        raise ValueError(f"Invalid video keys (not present in source dataset): {sorted(invalid)}")
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_resized"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    logging.info(
+        f"Resizing video keys {target_keys} of '{dataset.repo_id}' to {width}x{height}"
+    )
+
+    # Build feature spec for the destination dataset with updated shapes for
+    # the resized video keys. Feature shape convention is (H, W, C).
+    target_keys_set = set(target_keys)
+    new_features: dict = {}
+    for key, feature in dataset.meta.features.items():
+        new_feature = dict(feature)
+        if key in target_keys_set:
+            shape = list(feature.get("shape") or [])
+            if len(shape) >= 2:
+                shape[0] = height
+                shape[1] = width
+                new_feature["shape"] = tuple(shape)
+        new_features[key] = new_feature
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+    )
+
+    resolved_vcodec = vcodec if vcodec is not None else _infer_source_vcodec(dataset)
+    episode_mapping = {i: i for i in range(dataset.meta.total_episodes)}
+
+    video_metadata = _copy_and_resize_videos(
+        src_dataset=dataset,
+        dst_meta=new_meta,
+        width=width,
+        height=height,
+        target_video_keys=target_keys_set,
+        vcodec=resolved_vcodec,
+        pix_fmt=pix_fmt,
+    )
+
+    data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
+    _copy_and_reindex_episodes_metadata(dataset, new_meta, episode_mapping, data_metadata, video_metadata)
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    logging.info(f"Created resized dataset at {output_dir}")
+    return new_dataset
+
+
 def copy_episodes(
     src_dataset: LeRobotDataset,
     episode_indices: list[int] | None = None,
@@ -1044,6 +1150,189 @@ def remove_feature(
     )
 
 
+def rename_features(
+    dataset: LeRobotDataset,
+    rename_map: dict[str, str],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Rename features of a LeRobotDataset by creating a new dataset.
+
+    Renaming is applied to:
+
+    * ``info.json`` feature entries (preserving order of insertion);
+    * data parquet column names;
+    * video sub-directory names (for video features);
+    * per-episode metadata parquet columns (``videos/{key}/*``, ``stats/{key}/*``);
+    * dataset-level stats keys.
+
+    Args:
+        dataset: The source :class:`LeRobotDataset`.
+        rename_map: Mapping from existing feature key to new feature key. All
+            source keys must exist in the dataset; all target keys must not
+            collide with kept feature names. Required features (``timestamp``,
+            ``frame_index``, ``episode_index``, ``index``, ``task_index``)
+            cannot be renamed.
+        output_dir: Destination directory. Defaults to
+            ``$HF_LEROBOT_HOME/{repo_id}``.
+        repo_id: Identifier of the new dataset. Defaults to
+            ``f"{dataset.repo_id}_renamed"``.
+
+    Returns:
+        The newly created :class:`LeRobotDataset` with renamed features.
+    """
+    if not rename_map:
+        raise ValueError("rename_map is empty")
+
+    src_features = dataset.meta.features
+    required_features = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+
+    missing = [k for k in rename_map if k not in src_features]
+    if missing:
+        raise ValueError(f"Feature(s) not found in dataset: {missing}")
+
+    illegal = [k for k in rename_map if k in required_features]
+    if illegal:
+        raise ValueError(f"Cannot rename required features: {illegal}")
+    illegal_targets = [v for v in rename_map.values() if v in required_features]
+    if illegal_targets:
+        raise ValueError(f"Cannot rename to required feature names: {illegal_targets}")
+
+    if len(set(rename_map.values())) != len(rename_map.values()):
+        raise ValueError(f"Duplicate target names in rename_map: {rename_map}")
+
+    kept_keys = set(src_features) - set(rename_map)
+    collisions = sorted(set(rename_map.values()) & kept_keys)
+    if collisions:
+        raise ValueError(
+            f"Target names collide with existing kept feature names: {collisions}"
+        )
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_renamed"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # Preserve original ordering when building the new feature dict.
+    new_features: dict = {}
+    for key, feature in src_features.items():
+        new_key = rename_map.get(key, key)
+        new_features[new_key] = feature
+
+    video_keys_src = list(dataset.meta.video_keys)
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(video_keys_src) > 0,
+    )
+
+    # 1) Copy data parquet files, renaming the affected columns.
+    data_dir = dataset.root / DATA_DIR
+    parquet_files = sorted(data_dir.glob("*/*.parquet"))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {data_dir}")
+
+    for src_path in tqdm(parquet_files, desc="Renaming data columns"):
+        df = pd.read_parquet(src_path).reset_index(drop=True)
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        relative_path = src_path.relative_to(dataset.root)
+        chunk_idx = int(relative_path.parts[1].split("-")[1])
+        file_idx = int(relative_path.parts[2].split("-")[1].split(".")[0])
+        dst_path = new_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_parquet(df, dst_path, new_meta)
+
+    # 2) Copy video sub-directories, renaming the top-level "{video_key}" folder.
+    if video_keys_src:
+        src_videos_root = dataset.root / "videos"
+        dst_videos_root = new_meta.root / "videos"
+        for video_key in video_keys_src:
+            new_video_key = rename_map.get(video_key, video_key)
+            src_key_dir = src_videos_root / video_key
+            if not src_key_dir.exists():
+                logging.warning(f"Video directory missing for '{video_key}': {src_key_dir}")
+                continue
+            dst_key_dir = dst_videos_root / new_video_key
+            if dst_key_dir.exists():
+                shutil.rmtree(dst_key_dir)
+            dst_key_dir.parent.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Copying videos: '{video_key}' -> '{new_video_key}'")
+            shutil.copytree(src_key_dir, dst_key_dir)
+
+    # 3) Copy per-episode metadata parquet files, renaming columns and prefixes.
+    src_episodes_dir = dataset.root / "meta" / "episodes"
+    dst_episodes_dir = new_meta.root / "meta" / "episodes"
+    if src_episodes_dir.exists():
+        for src_path in tqdm(
+            sorted(src_episodes_dir.rglob("*.parquet")), desc="Renaming episodes metadata"
+        ):
+            df = pd.read_parquet(src_path)
+            column_renames: dict[str, str] = {}
+            for col in df.columns:
+                for old_key, new_key in rename_map.items():
+                    if col == old_key:
+                        column_renames[col] = new_key
+                        break
+                    if col.startswith(f"videos/{old_key}/"):
+                        column_renames[col] = f"videos/{new_key}/" + col[len(f"videos/{old_key}/"):]
+                        break
+                    if col.startswith(f"stats/{old_key}/"):
+                        column_renames[col] = f"stats/{new_key}/" + col[len(f"stats/{old_key}/"):]
+                        break
+            if column_renames:
+                df = df.rename(columns=column_renames)
+            dst_path = dst_episodes_dir / src_path.relative_to(src_episodes_dir)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(dst_path, index=False)
+
+    # 4) Copy tasks unchanged.
+    if dataset.meta.tasks is not None:
+        write_tasks(dataset.meta.tasks, new_meta.root)
+
+    # 5) Write totals & splits in info.json (features were already renamed via create()).
+    new_meta.info.update(
+        {
+            "total_episodes": dataset.meta.total_episodes,
+            "total_frames": dataset.meta.total_frames,
+            "total_tasks": dataset.meta.total_tasks,
+            "splits": dataset.meta.info.get(
+                "splits", {"train": f"0:{dataset.meta.total_episodes}"}
+            ),
+        }
+    )
+    # Preserve per-video "info" (codec, resolution, ...) under renamed keys.
+    src_features_info = dataset.meta.info.get("features", {})
+    for video_key in video_keys_src:
+        new_video_key = rename_map.get(video_key, video_key)
+        src_video_info = (src_features_info.get(video_key) or {}).get("info")
+        if src_video_info and new_video_key in new_meta.info.get("features", {}):
+            new_meta.info["features"][new_video_key]["info"] = src_video_info
+    write_info(new_meta.info, new_meta.root)
+
+    # 6) Rewrite dataset-level stats with renamed keys.
+    if dataset.meta.stats:
+        new_stats = {
+            rename_map.get(key, key): value for key, value in dataset.meta.stats.items()
+        }
+        write_stats(new_stats, new_meta.root)
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    logging.info(
+        f"Renamed {len(rename_map)} feature(s) -> new dataset at {output_dir}"
+    )
+    return new_dataset
+
+
 def _fractions_to_episode_indices(
     total_episodes: int,
     splits: dict[str, float],
@@ -1274,6 +1563,177 @@ def _keep_episodes_from_video_with_av(
 
     out.close()
     in_container.close()
+
+
+def _resize_video_with_av(
+    input_path: Path,
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+) -> None:
+    """Re-encode a video file resizing every frame to ``width`` x ``height`` using PyAV.
+
+    Args:
+        input_path: Source video file path.
+        output_path: Destination video file path.
+        width: Target frame width in pixels.
+        height: Target frame height in pixels.
+        fps: Frame rate of the video.
+        vcodec: Video codec to use for encoding.
+        pix_fmt: Pixel format for output video.
+    """
+    from fractions import Fraction
+
+    import av
+
+    in_container = av.open(str(input_path))
+
+    if not in_container.streams.video:
+        raise ValueError(
+            f"No video streams found in {input_path}. "
+            "The video file may be corrupted or empty."
+        )
+
+    v_in = in_container.streams.video[0]
+
+    out = av.open(str(output_path), mode="w")
+
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    v_out = out.add_stream(vcodec, rate=fps_fraction)
+
+    v_out.width = width
+    v_out.height = height
+    v_out.pix_fmt = pix_fmt
+    v_out.time_base = Fraction(1, int(fps))
+
+    out.start_encoding()
+
+    frame_count = 0
+    for packet in in_container.demux(v_in):
+        for frame in packet.decode():
+            if frame is None:
+                continue
+            new_frame = frame.reformat(width=width, height=height, format=pix_fmt)
+            new_frame.pts = frame_count
+            new_frame.time_base = Fraction(1, int(fps))
+            for pkt in v_out.encode(new_frame):
+                out.mux(pkt)
+            frame_count += 1
+
+    for pkt in v_out.encode():
+        out.mux(pkt)
+
+    out.close()
+    in_container.close()
+
+
+def _copy_and_resize_videos(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    width: int,
+    height: int,
+    target_video_keys: set[str],
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+) -> dict[int, dict]:
+    """Copy every video file, resizing the targeted video keys.
+
+    Video files for keys not in ``target_video_keys`` are copied as-is.
+    Per-key entries in ``dst_meta.info["features"][key]["info"]`` are refreshed
+    from a destination file so the new resolution / codec lands in
+    ``meta/info.json``.
+
+    Args:
+        src_dataset: Source dataset to copy from.
+        dst_meta: Destination metadata object.
+        width: Target frame width in pixels.
+        height: Target frame height in pixels.
+        target_video_keys: Set of video feature keys to resize.
+        vcodec: Video codec to use when re-encoding.
+        pix_fmt: Pixel format for re-encoded videos.
+
+    Returns:
+        Dict mapping episode index (identity mapping is assumed) to its video
+        metadata (chunk_index, file_index, from_timestamp, to_timestamp).
+    """
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    if dst_meta.video_path is None:
+        raise ValueError("Destination metadata has no video_path defined")
+    assert src_dataset.meta.video_path is not None
+
+    episodes_video_metadata: dict[int, dict] = {
+        i: {} for i in range(src_dataset.meta.total_episodes)
+    }
+    refresh_video_info_paths: dict[str, Path] = {}
+
+    for video_key in src_dataset.meta.video_keys:
+        logging.info(f"Processing videos for {video_key}")
+
+        file_to_episodes: dict[tuple[int, int], list[int]] = {}
+        for old_idx in range(src_dataset.meta.total_episodes):
+            src_ep = src_dataset.meta.episodes[old_idx]
+            chunk_idx = src_ep[f"videos/{video_key}/chunk_index"]
+            file_idx = src_ep[f"videos/{video_key}/file_index"]
+            file_to_episodes.setdefault((chunk_idx, file_idx), []).append(old_idx)
+
+        for (chunk_idx, file_idx), episodes_in_file in tqdm(
+            sorted(file_to_episodes.items()), desc=f"Processing {video_key} video files"
+        ):
+            src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            dst_video_path = dst_meta.root / dst_meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if video_key in target_video_keys:
+                logging.info(
+                    f"Resizing {video_key} (chunk {chunk_idx}, file {file_idx}) "
+                    f"to {width}x{height}"
+                )
+                _resize_video_with_av(
+                    src_video_path,
+                    dst_video_path,
+                    width,
+                    height,
+                    src_dataset.meta.fps,
+                    vcodec,
+                    pix_fmt,
+                )
+            else:
+                shutil.copy(src_video_path, dst_video_path)
+
+            refresh_video_info_paths[video_key] = dst_video_path
+
+            for old_idx in episodes_in_file:
+                src_ep = src_dataset.meta.episodes[old_idx]
+                episodes_video_metadata[old_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
+                episodes_video_metadata[old_idx][f"videos/{video_key}/file_index"] = file_idx
+                episodes_video_metadata[old_idx][f"videos/{video_key}/from_timestamp"] = src_ep[
+                    f"videos/{video_key}/from_timestamp"
+                ]
+                episodes_video_metadata[old_idx][f"videos/{video_key}/to_timestamp"] = src_ep[
+                    f"videos/{video_key}/to_timestamp"
+                ]
+
+    for video_key, dst_video_path in refresh_video_info_paths.items():
+        if video_key not in dst_meta.info.get("features", {}):
+            continue
+        try:
+            dst_meta.info["features"][video_key]["info"] = get_video_info(dst_video_path)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f"Failed to refresh video info for '{video_key}' from "
+                f"{dst_video_path}: {e}"
+            )
+
+    return episodes_video_metadata
 
 
 # Canonical codec name (as reported by PyAV / stored in meta info) -> FFmpeg encoder name.
