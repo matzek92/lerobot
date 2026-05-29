@@ -15,6 +15,7 @@
 from .act.configuration_act import ACTConfig as ACTConfig
 from .cnn_bc.configuration_cnn_bc import CNNBCConfig as CNNBCConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .dot.configuration_dot import DOTConfig as DOTConfig
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
@@ -29,6 +30,7 @@ from .sarm.configuration_sarm import SARMConfig as SARMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
+from .vision_dit.configuration_vision_dit import VisionDiTConfig as VisionDiTConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
@@ -42,6 +44,7 @@ __all__ = [
     "ACTConfig",
     "CNNBCConfig",
     "DiffusionConfig",
+    "DOTConfig",
     "GrootConfig",
     "MultiTaskDiTConfig",
     "PI0Config",
@@ -52,6 +55,7 @@ __all__ = [
     "SARMConfig",
     "SmolVLAConfig",
     "TDMPCConfig",
+    "VisionDiTConfig",
     "VQBeTConfig",
     "WallXConfig",
     "XVLAConfig",

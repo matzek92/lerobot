@@ -93,12 +93,30 @@ class CNNBCConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # Supported torchvision CNN backbone families. The model is loaded via
+    # ``torchvision.models.get_model`` and its final classification head is stripped.
+    _SUPPORTED_BACKBONE_PREFIXES: tuple[str, ...] = (
+        "resnet",
+        "resnext",
+        "wide_resnet",
+        "regnet",
+        "convnext",
+        "efficientnet",
+        "mobilenet",
+        "mnasnet",
+        "shufflenet",
+        "densenet",
+        "vgg",
+        "squeezenet",
+    )
+
     def __post_init__(self):
         super().__post_init__()
 
-        if not self.vision_backbone.startswith("resnet"):
+        if not any(self.vision_backbone.startswith(p) for p in self._SUPPORTED_BACKBONE_PREFIXES):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` '{self.vision_backbone}' is not in the supported torchvision "
+                f"backbone families: {self._SUPPORTED_BACKBONE_PREFIXES}."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

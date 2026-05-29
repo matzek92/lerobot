@@ -31,6 +31,45 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
+def _build_cnn_backbone(name: str, weights: str | None) -> tuple[nn.Module, int]:
+    """Build a torchvision CNN backbone with its classification head stripped.
+
+    Returns the backbone (producing a pooled feature vector ``(B, embed_dim)`` or a
+    pre-pool feature map that is flattened by the caller) and the embedding dimension.
+    """
+    model = torchvision.models.get_model(name, weights=weights)
+
+    if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
+        embed_dim = model.fc.in_features
+        model.fc = nn.Identity()
+    elif hasattr(model, "classifier"):
+        classifier = model.classifier
+        if isinstance(classifier, nn.Linear):
+            embed_dim = classifier.in_features
+        elif isinstance(classifier, nn.Sequential):
+            last_linear = None
+            for m in classifier:
+                if isinstance(m, nn.Linear):
+                    last_linear = m
+            if last_linear is None:
+                raise ValueError(
+                    f"Could not find a Linear layer in classifier of backbone '{name}'."
+                )
+            embed_dim = last_linear.in_features
+        else:
+            raise ValueError(
+                f"Unsupported classifier type {type(classifier).__name__} for backbone '{name}'."
+            )
+        model.classifier = nn.Identity()
+    else:
+        raise ValueError(
+            f"Cannot strip classification head from torchvision backbone '{name}': "
+            "no `fc` or `classifier` attribute found."
+        )
+
+    return model, embed_dim
+
+
 class CNNBCPolicy(PreTrainedPolicy):
     """CNN Behavioral Cloning Policy.
 
@@ -187,14 +226,9 @@ class CNNBCNet(nn.Module):
         self.config = config
 
         if config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                weights=config.pretrained_backbone_weights
+            self.backbone, backbone_out_channels = _build_cnn_backbone(
+                config.vision_backbone, config.pretrained_backbone_weights
             )
-            # Backbone feature dimension (e.g. 512 for ResNet18/34, 2048 for ResNet50+).
-            backbone_out_channels = backbone_model.fc.in_features
-            # Remove the final global average pooling and classification head; keep conv layers only.
-            self.backbone = nn.Sequential(*list(backbone_model.children())[:-2])
-            self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         else:
             backbone_out_channels = 0
 
@@ -251,9 +285,9 @@ class CNNBCNet(nn.Module):
 
         if self.config.image_features:
             for img in batch[OBS_IMAGES]:
-                x = self.backbone(img)  # (B, C_out, H', W')
-                x = self.global_pool(x)  # (B, C_out, 1, 1)
-                x = x.flatten(1)  # (B, C_out)
+                x = self.backbone(img)  # (B, C_out)
+                if x.dim() == 4:
+                    x = x.flatten(1)
                 features.append(x)
 
         if self.config.robot_state_feature is not None:

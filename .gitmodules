@@ -1,0 +1,3 @@
+[submodule "external/dot_policy"]
+	path = external/dot_policy
+	url = https://github.com/IliaLarchenko/dot_policy

@@ -33,6 +33,7 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.cnn_bc.configuration_cnn_bc import CNNBCConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.dot.configuration_dot import DOTConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -44,6 +45,7 @@ from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.policies.vision_dit.configuration_vision_dit import VisionDiTConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
@@ -64,6 +66,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .dot.configuration_dot import DOTConfig
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
@@ -75,6 +78,7 @@ from .sarm.configuration_sarm import SARMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
 from .utils import validate_visual_features_consistency
+from .vision_dit.configuration_vision_dit import VisionDiTConfig
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
@@ -130,10 +134,18 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.cnn_bc.modeling_cnn_bc import CNNBCPolicy
 
         return CNNBCPolicy
+    elif name == "dot":
+        from .dot.modeling_dot import DOTPolicy
+
+        return DOTPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
         return MultiTaskDiTPolicy
+    elif name == "vision_dit":
+        from .vision_dit.modeling_vision_dit import VisionDiTPolicy
+
+        return VisionDiTPolicy
     elif name == "vqbet":
         from .vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -212,8 +224,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "cnn_bc":
         return CNNBCConfig(**kwargs)
+    elif policy_type == "dot":
+        return DOTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
+    elif policy_type == "vision_dit":
+        return VisionDiTConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
@@ -360,12 +376,30 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, DOTConfig):
+        from .dot.processor_dot import make_dot_pre_post_processors
+
+        processors = make_dot_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, MultiTaskDiTConfig):
         from .multi_task_dit.processor_multi_task_dit import (
             make_multi_task_dit_pre_post_processors,
         )
 
         processors = make_multi_task_dit_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, VisionDiTConfig):
+        from .vision_dit.processor_vision_dit import (
+            make_vision_dit_pre_post_processors,
+        )
+
+        processors = make_vision_dit_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
