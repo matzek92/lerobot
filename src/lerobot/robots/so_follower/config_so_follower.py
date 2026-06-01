@@ -41,6 +41,21 @@ class SOFollowerConfig:
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
 
+    # Optional external analog sensor streaming over serial (e.g. Arduino on A0).
+    sensor_enabled: bool = False
+    sensor_port: str | None = None
+    sensor_baud_rate: int = 115200
+    sensor_timeout_s: float = 0.01
+    # Which value to extract from the incoming serial line.
+    # Supported: "live" (ADC_live), "mean10" (ADC_mean10), "dmean" (dMean).
+    sensor_value_mode: str = "mean10"
+    # Name of the extra observation scalar feature in the dataset/state vector.
+    sensor_feature_name: str = "sensor.a0_mean"
+    # Used when no valid serial sample is available yet.
+    sensor_default_value: float = 0.0
+    # If True, fail on serial connection/read setup issues. If False, continue without sensor.
+    sensor_strict: bool = False
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")
