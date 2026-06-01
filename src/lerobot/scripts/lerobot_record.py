@@ -70,6 +70,7 @@ lerobot-record \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -463,6 +464,11 @@ def record_loop(
                         task=single_task,
                         robot_type=robot.robot_type,
                     )
+                    logging.debug(
+                        "Predicted policy action (interpolated step) shape=%s preview=%s",
+                        tuple(action_values.shape),
+                        action_values.detach().flatten()[:6].cpu().tolist(),
+                    )
                     act_processed_policy = make_robot_action(action_values, dataset.features)
                     robot_action_to_send = robot_action_processor((act_processed_policy, obs))
 
@@ -488,6 +494,11 @@ def record_loop(
                     use_amp=policy.config.use_amp,
                     task=single_task,
                     robot_type=robot.robot_type,
+                )
+                logging.debug(
+                    "Predicted policy action shape=%s preview=%s",
+                    tuple(action_values.shape),
+                    action_values.detach().flatten()[:6].cpu().tolist(),
                 )
                 act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
                 # Applies a pipeline to the action, default is IdentityProcessor
@@ -555,7 +566,7 @@ def record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
-    init_logging()
+    init_logging(console_level=os.getenv("LEROBOT_LOG_LEVEL", "INFO"))
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)

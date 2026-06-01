@@ -132,6 +132,8 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+    # Objective.
+    objective: str = "diffusion"
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
@@ -141,6 +143,14 @@ class DiffusionConfig(PreTrainedConfig):
     prediction_type: str = "epsilon"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+    # Flow matching.
+    sigma_min: float = 0.0
+    num_integration_steps: int = 100
+    integration_method: str = "euler"
+    timestep_sampling_strategy: str = "beta"
+    timestep_sampling_s: float = 0.999
+    timestep_sampling_alpha: float = 1.5
+    timestep_sampling_beta: float = 1.0
 
     # Inference
     num_inference_steps: int | None = None
@@ -169,17 +179,51 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        supported_prediction_types = ["epsilon", "sample"]
-        if self.prediction_type not in supported_prediction_types:
-            raise ValueError(
-                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
-            )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.noise_scheduler_type}."
-            )
+        supported_objectives = ["diffusion", "flow_matching"]
+        if self.objective not in supported_objectives:
+            raise ValueError(f"`objective` must be one of {supported_objectives}. Got {self.objective}.")
+
+        if self.is_diffusion:
+            supported_prediction_types = ["epsilon", "sample"]
+            if self.prediction_type not in supported_prediction_types:
+                raise ValueError(
+                    f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
+                )
+            supported_noise_schedulers = ["DDPM", "DDIM"]
+            if self.noise_scheduler_type not in supported_noise_schedulers:
+                raise ValueError(
+                    f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+                    f"Got {self.noise_scheduler_type}."
+                )
+        elif self.is_flow_matching:
+            if not (0.0 <= self.sigma_min <= 1.0):
+                raise ValueError(f"`sigma_min` must be in [0, 1]. Got {self.sigma_min}.")
+            if self.num_integration_steps <= 0:
+                raise ValueError(
+                    f"`num_integration_steps` must be positive. Got {self.num_integration_steps}."
+                )
+            if self.integration_method not in ["euler", "rk4"]:
+                raise ValueError(
+                    f"`integration_method` must be one of ['euler', 'rk4']. Got {self.integration_method}."
+                )
+            if self.timestep_sampling_strategy not in ["uniform", "beta"]:
+                raise ValueError(
+                    "`timestep_sampling_strategy` must be one of ['uniform', 'beta']. "
+                    f"Got {self.timestep_sampling_strategy}."
+                )
+            if self.timestep_sampling_strategy == "beta":
+                if not (0.0 < self.timestep_sampling_s <= 1.0):
+                    raise ValueError(
+                        f"`timestep_sampling_s` must be in (0, 1]. Got {self.timestep_sampling_s}."
+                    )
+                if self.timestep_sampling_alpha <= 0:
+                    raise ValueError(
+                        f"`timestep_sampling_alpha` must be positive. Got {self.timestep_sampling_alpha}."
+                    )
+                if self.timestep_sampling_beta <= 0:
+                    raise ValueError(
+                        f"`timestep_sampling_beta` must be positive. Got {self.timestep_sampling_beta}."
+                    )
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
@@ -255,3 +299,11 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def is_diffusion(self) -> bool:
+        return self.objective == "diffusion"
+
+    @property
+    def is_flow_matching(self) -> bool:
+        return self.objective == "flow_matching"
