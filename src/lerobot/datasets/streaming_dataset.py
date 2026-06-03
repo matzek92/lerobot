@@ -507,6 +507,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             if self.image_transforms is not None or self.guide_image_transforms is not None:
                 image_keys = self.meta.camera_keys
                 for cam in image_keys:
+                    # An empty guide_key_contains disables guide-stream matching entirely.
                     if self.guide_key_contains and self.guide_key_contains in cam:
                         if self.guide_image_transforms is not None:
                             video_frames[cam] = self.guide_image_transforms(video_frames[cam])

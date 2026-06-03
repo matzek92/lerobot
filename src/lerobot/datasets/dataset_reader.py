@@ -301,6 +301,7 @@ class DatasetReader:
         if self._image_transforms is not None or self._guide_image_transforms is not None:
             image_keys = self._meta.camera_keys
             for cam in image_keys:
+                # An empty guide_key_contains disables guide-stream matching entirely.
                 if self._guide_key_contains and self._guide_key_contains in cam:
                     if self._guide_image_transforms is not None:
                         item[cam] = self._guide_image_transforms(item[cam])
