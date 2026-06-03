@@ -74,6 +74,16 @@ class ActionInterpolator:
         """Check if a new action is needed from the queue."""
         return self._idx >= len(self._buffer)
 
+    @property
+    def buffer_length(self) -> int:
+        """Current number of control steps prepared in the interpolation buffer."""
+        return len(self._buffer)
+
+    @property
+    def buffer_remaining(self) -> int:
+        """Remaining buffered control steps that can still be emitted."""
+        return max(0, len(self._buffer) - self._idx)
+
     def add(self, action: Tensor) -> None:
         """Add a new action and compute interpolated sequence.
 

@@ -70,6 +70,7 @@ lerobot-record \
 """
 
 import logging
+import math
 import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -422,6 +423,7 @@ def record_loop(
     # Calculate control interval based on interpolation
     use_interpolation = interpolator is not None and interpolator.enabled and policy is not None
     control_interval = interpolator.get_control_interval(fps) if interpolator else 1 / fps
+    target_control_hz = 1.0 / control_interval
     # Pre-compute action key order outside the hot loop — it won't change mid-episode.
     action_keys = sorted(robot.action_features) if use_interpolation else []
 
@@ -431,6 +433,18 @@ def record_loop(
     policy_executor: ThreadPoolExecutor | None = None
     pending_policy_future: Future | None = None
     ready_policy_action: torch.Tensor | None = None
+    ready_policy_inference_time_s: float | None = None
+    last_robot_action_to_send: RobotAction | None = None
+    current_chunk_started_t: float | None = None
+    current_chunk_sent_steps = 0
+    current_chunk_expected_steps = 0
+    inference_times_ms: list[float] = []
+    chunk_execution_times_ms: list[float] = []
+    slow_loop_count = 0
+    slow_loop_total_s = 0.0
+    slow_loop_worst_s = 0.0
+    last_slow_loop_warning_t = 0.0
+    slow_loop_warning_interval_s = 5.0
 
     if (
         async_policy_inference
@@ -444,16 +458,43 @@ def record_loop(
     def submit_async_policy_inference(observation: dict[str, Any]) -> Future | None:
         if policy_executor is None:
             return None
+
+        inference_start_t = time.perf_counter()
+
+        def run_inference() -> tuple[torch.Tensor, float]:
+            action = predict_action(
+                observation=observation,
+                policy=policy,
+                device=get_safe_torch_device(policy.config.device),
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                use_amp=policy.config.use_amp,
+                task=single_task,
+                robot_type=robot.robot_type,
+            )
+            return action, time.perf_counter() - inference_start_t
+
         return policy_executor.submit(
-            predict_action,
-            observation=observation,
-            policy=policy,
-            device=get_safe_torch_device(policy.config.device),
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            use_amp=policy.config.use_amp,
-            task=single_task,
-            robot_type=robot.robot_type,
+            run_inference,
+        )
+
+    def log_timing_summary(metric_name: str, values_ms: list[float]) -> None:
+        if not values_ms:
+            return
+
+        sorted_values = sorted(values_ms)
+        n = len(sorted_values)
+        p95_idx = max(0, min(n - 1, math.ceil(0.95 * n) - 1))
+        mean_ms = sum(sorted_values) / n
+        p95_ms = sorted_values[p95_idx]
+        max_ms = sorted_values[-1]
+        logging.info(
+            "%s summary: count=%d mean=%.1f ms p95=%.1f ms max=%.1f ms",
+            metric_name,
+            n,
+            mean_ms,
+            p95_ms,
+            max_ms,
         )
 
     try:
@@ -478,7 +519,7 @@ def record_loop(
     
             if pending_policy_future is not None and pending_policy_future.done() and ready_policy_action is None:
                 # Surface inference exceptions on the main thread.
-                ready_policy_action = pending_policy_future.result()
+                ready_policy_action, ready_policy_inference_time_s = pending_policy_future.result()
                 pending_policy_future = None
     
             # Track whether this iteration should be recorded to the dataset.
@@ -491,20 +532,35 @@ def record_loop(
                 # With interpolation: only call policy when interpolator needs new action
                 if use_interpolation:
                     ran_inference = False
+
+                    if interpolator.needs_new_action() and current_chunk_started_t is not None:
+                        chunk_elapsed_s = time.perf_counter() - current_chunk_started_t
+                        chunk_execution_times_ms.append(chunk_elapsed_s * 1000.0)
+                        current_chunk_started_t = None
+                        current_chunk_sent_steps = 0
+                        current_chunk_expected_steps = 0
     
                     if interpolator.needs_new_action():
                         if policy_executor is not None:
                             if ready_policy_action is None and pending_policy_future is None:
                                 pending_policy_future = submit_async_policy_inference(observation_frame)
                             if ready_policy_action is None:
-                                # Interpolation buffer is exhausted and next policy action is not ready yet.
-                                continue
-                            action_values = ready_policy_action
-                            ready_policy_action = None
-                            ran_inference = True
-                            if pending_policy_future is None:
-                                pending_policy_future = submit_async_policy_inference(observation_frame)
+                                # Keep control continuous while waiting for next policy chunk.
+                                if last_robot_action_to_send is None:
+                                    # No safe fallback available yet.
+                                    continue
+                                robot_action_to_send = dict(last_robot_action_to_send)
+                                action_values = robot_action_to_send
+                                is_record_frame = False
+                                logging.debug("Holding last action while waiting for async policy output")
+                            else:
+                                action_values = ready_policy_action
+                                ready_policy_action = None
+                                ran_inference = True
+                                if pending_policy_future is None:
+                                    pending_policy_future = submit_async_policy_inference(observation_frame)
                         else:
+                            inference_start_t = time.perf_counter()
                             action_values = predict_action(
                                 observation=observation_frame,
                                 policy=policy,
@@ -515,38 +571,63 @@ def record_loop(
                                 task=single_task,
                                 robot_type=robot.robot_type,
                             )
+                            ready_policy_inference_time_s = time.perf_counter() - inference_start_t
                             ran_inference = True
     
-                        logging.debug(
-                            "Predicted policy action (interpolated step) shape=%s preview=%s",
-                            tuple(action_values.shape),
-                            action_values.detach().flatten()[:6].cpu().tolist(),
-                        )
-                        act_processed_policy = make_robot_action(action_values, dataset.features)
-                        robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-    
-                        action_tensor = torch.tensor([robot_action_to_send[k] for k in action_keys])
-                        interpolator.add(action_tensor)
+                        if ran_inference:
+                            logging.debug(
+                                "Predicted policy action (interpolated step) shape=%s preview=%s",
+                                tuple(action_values.shape),
+                                action_values.detach().flatten()[:6].cpu().tolist(),
+                            )
+                            act_processed_policy = make_robot_action(action_values, dataset.features)
+                            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+
+                            action_tensor = torch.tensor([robot_action_to_send[k] for k in action_keys])
+                            interpolator.add(action_tensor)
+
+                            if ready_policy_inference_time_s is not None:
+                                inference_times_ms.append(ready_policy_inference_time_s * 1000.0)
+                            current_chunk_started_t = time.perf_counter()
+                            current_chunk_sent_steps = 0
+                            current_chunk_expected_steps = interpolator.buffer_length
+                            ready_policy_inference_time_s = None
     
                     interp_action = interpolator.get()
                     if interp_action is not None:
                         robot_action_to_send = {k: interp_action[i].item() for i, k in enumerate(action_keys)}
                         action_values = robot_action_to_send
+                        if current_chunk_started_t is not None:
+                            current_chunk_sent_steps += 1
                     else:
-                        continue
+                        if last_robot_action_to_send is None:
+                            continue
+                        robot_action_to_send = dict(last_robot_action_to_send)
+                        action_values = robot_action_to_send
+                        is_record_frame = False
+                        logging.debug("Interpolator empty; holding last action")
     
                     is_record_frame = ran_inference
                 else:
+                    got_policy_action = False
                     if policy_executor is not None:
                         if ready_policy_action is None and pending_policy_future is None:
                             pending_policy_future = submit_async_policy_inference(observation_frame)
                         if ready_policy_action is None:
-                            continue
-                        action_values = ready_policy_action
-                        ready_policy_action = None
-                        if pending_policy_future is None:
-                            pending_policy_future = submit_async_policy_inference(observation_frame)
+                            if last_robot_action_to_send is None:
+                                continue
+                            robot_action_to_send = dict(last_robot_action_to_send)
+                            action_values = robot_action_to_send
+                            is_record_frame = False
+                            logging.debug("Holding last action while waiting for async policy output")
+                        else:
+                            action_values = ready_policy_action
+                            ready_policy_action = None
+                            got_policy_action = True
+                            if pending_policy_future is None:
+                                pending_policy_future = submit_async_policy_inference(observation_frame)
                     else:
+                        inference_start_t = time.perf_counter()
                         action_values = predict_action(
                             observation=observation_frame,
                             policy=policy,
@@ -557,15 +638,21 @@ def record_loop(
                             task=single_task,
                             robot_type=robot.robot_type,
                         )
-                    logging.debug(
-                        "Predicted policy action shape=%s preview=%s",
-                        tuple(action_values.shape),
-                        action_values.detach().flatten()[:6].cpu().tolist(),
-                    )
-                    act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
-                    # Applies a pipeline to the action, default is IdentityProcessor
-                    robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-                    action_values = robot_action_to_send
+                        ready_policy_inference_time_s = time.perf_counter() - inference_start_t
+                        got_policy_action = True
+                    if got_policy_action:
+                        if ready_policy_inference_time_s is not None:
+                            inference_times_ms.append(ready_policy_inference_time_s * 1000.0)
+                            ready_policy_inference_time_s = None
+                        logging.debug(
+                            "Predicted policy action shape=%s preview=%s",
+                            tuple(action_values.shape),
+                            action_values.detach().flatten()[:6].cpu().tolist(),
+                        )
+                        act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+                        # Applies a pipeline to the action, default is IdentityProcessor
+                        robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                        action_values = robot_action_to_send
     
             elif policy is None and isinstance(teleop, Teleoperator):
                 act = teleop.get_action()
@@ -600,6 +687,7 @@ def record_loop(
             # so action actually sent is saved in the dataset. action = postprocessor.process(action)
             # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
             _sent_action = robot.send_action(robot_action_to_send)
+            last_robot_action_to_send = _sent_action
     
             # Write to dataset (only on real policy frames, not interpolated-only iterations)
             if dataset is not None and is_record_frame:
@@ -616,14 +704,32 @@ def record_loop(
     
             sleep_time_s: float = control_interval - dt_s
             if sleep_time_s < 0:
-                logging.warning(
-                    f"⚠️  Record loop running slower ({1 / dt_s:.1f} Hz) than target ({fps} Hz). "
-                    f"Frames may be dropped and control unstable. Check: Camera FPS, Policy inference time, CPU usage."
-                )
+                slow_loop_count += 1
+                slow_loop_total_s += dt_s
+                slow_loop_worst_s = max(slow_loop_worst_s, dt_s)
+                now_t = time.perf_counter()
+                if slow_loop_count == 1 or (now_t - last_slow_loop_warning_t) >= slow_loop_warning_interval_s:
+                    logging.warning(
+                        "Record loop below target control rate: current=%.1f Hz target=%.1f Hz (underruns=%d)",
+                        1 / dt_s,
+                        target_control_hz,
+                        slow_loop_count,
+                    )
+                    last_slow_loop_warning_t = now_t
     
             precise_sleep(max(sleep_time_s, 0.0))
     
             timestamp = time.perf_counter() - start_episode_t
+
+        log_timing_summary("Policy inference", inference_times_ms)
+        log_timing_summary("Policy action chunk execution", chunk_execution_times_ms)
+        if slow_loop_count > 0:
+            logging.info(
+                "Record loop FPS underrun summary: count=%d mean_loop=%.1f ms worst_loop=%.1f ms",
+                slow_loop_count,
+                (slow_loop_total_s / slow_loop_count) * 1000.0,
+                slow_loop_worst_s * 1000.0,
+            )
     finally:
         if policy_executor is not None:
             policy_executor.shutdown(wait=False, cancel_futures=True)
