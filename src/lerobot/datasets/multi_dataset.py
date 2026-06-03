@@ -48,6 +48,8 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
+        guide_image_transforms: Callable | None = None,
+        guide_key_contains: str = "guide",
     ):
         super().__init__()
         self.repo_ids = repo_ids
@@ -65,6 +67,8 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 tolerance_s=self.tolerances_s[repo_id],
                 download_videos=download_videos,
                 video_backend=video_backend,
+                guide_image_transforms=guide_image_transforms,
+                guide_key_contains=guide_key_contains,
             )
             for repo_id in repo_ids
         ]
@@ -96,6 +100,8 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # per robot.
         self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
         self.set_image_transforms(image_transforms)
+        self.set_guide_image_transforms(guide_image_transforms)
+        self.guide_key_contains = guide_key_contains
 
     def set_image_transforms(self, image_transforms: Callable | None) -> None:
         """Replace the transform for this dataset and its children."""
@@ -105,9 +111,21 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         for dataset in getattr(self, "_datasets", []):
             dataset.set_image_transforms(self.image_transforms)
 
+    def set_guide_image_transforms(self, guide_image_transforms: Callable | None) -> None:
+        """Replace the guide stream transform for this dataset and its children."""
+        if guide_image_transforms is not None and not callable(guide_image_transforms):
+            raise TypeError("guide_image_transforms must be callable or None.")
+        self.guide_image_transforms = guide_image_transforms
+        for dataset in getattr(self, "_datasets", []):
+            dataset.set_guide_image_transforms(self.guide_image_transforms)
+
     def clear_image_transforms(self) -> None:
         """Remove the transform from this dataset and its children."""
         self.set_image_transforms(None)
+
+    def clear_guide_image_transforms(self) -> None:
+        """Remove the guide stream transform from this dataset and its children."""
+        self.set_guide_image_transforms(None)
 
     @property
     def repo_id_to_index(self):

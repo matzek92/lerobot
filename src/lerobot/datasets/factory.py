@@ -77,6 +77,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
+    guide_image_transforms = (
+        ImageTransforms(cfg.dataset.guide_image_transforms)
+        if cfg.dataset.guide_image_transforms.enable
+        else None
+    )
 
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
@@ -94,6 +99,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 video_backend=cfg.dataset.video_backend,
                 return_uint8=True,
                 tolerance_s=cfg.tolerance_s,
+                guide_image_transforms=guide_image_transforms,
+                guide_key_contains=cfg.dataset.guide_key_contains,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -106,6 +113,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=cfg.num_workers,
                 tolerance_s=cfg.tolerance_s,
                 return_uint8=True,
+                guide_image_transforms=guide_image_transforms,
+                guide_key_contains=cfg.dataset.guide_key_contains,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
@@ -115,6 +124,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             # delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
+            guide_image_transforms=guide_image_transforms,
+            guide_key_contains=cfg.dataset.guide_key_contains,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "

@@ -32,6 +32,12 @@ class DatasetConfig:
     root: str | None = None
     episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    # Separate augmentation config for guide camera streams (default: no augmentation).
+    # Camera keys whose name contains `guide_key_contains` are treated as guide streams and
+    # receive `guide_image_transforms` instead of `image_transforms`.
+    guide_image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    # Substring used to identify guide camera keys (e.g. "observation.images.guide_laptop" contains "guide").
+    guide_key_contains: str = "guide"
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)

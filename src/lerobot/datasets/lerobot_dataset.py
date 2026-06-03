@@ -62,6 +62,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        guide_image_transforms: Callable | None = None,
+        guide_key_contains: str = "guide",
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -198,6 +200,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._requested_root = Path(root) if root else None
         self.reader = None
         self.set_image_transforms(image_transforms)
+        self.guide_image_transforms = guide_image_transforms
+        self.guide_key_contains = guide_key_contains
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
         self.tolerance_s = tolerance_s
@@ -228,6 +232,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
+            guide_image_transforms=guide_image_transforms,
+            guide_key_contains=guide_key_contains,
         )
 
         # Load actual data
@@ -494,16 +500,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
         )
 
     def set_image_transforms(self, image_transforms: Callable | None) -> None:
-        """Replace the transform applied to visual observations."""
+        """Replace the transform applied to non-guide visual observations."""
         if image_transforms is not None and not callable(image_transforms):
             raise TypeError("image_transforms must be callable or None.")
         self.image_transforms = image_transforms
         if self.reader is not None:
             self.reader._image_transforms = image_transforms
 
+    def set_guide_image_transforms(self, guide_image_transforms: Callable | None) -> None:
+        """Replace the transform applied to guide camera stream observations."""
+        if guide_image_transforms is not None and not callable(guide_image_transforms):
+            raise TypeError("guide_image_transforms must be callable or None.")
+        self.guide_image_transforms = guide_image_transforms
+        if self.reader is not None:
+            self.reader._guide_image_transforms = guide_image_transforms
+
     def clear_image_transforms(self) -> None:
         """Remove the transform applied to visual observations."""
         self.set_image_transforms(None)
+
+    def clear_guide_image_transforms(self) -> None:
+        """Remove the transform applied to guide camera stream observations."""
+        self.set_guide_image_transforms(None)
 
     # ── Hub methods (stay on facade) ──────────────────────────────────
 
@@ -693,6 +711,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.revision = None
         obj.tolerance_s = tolerance_s
         obj.image_transforms = None
+        obj.guide_image_transforms = None
+        obj.guide_key_contains = "guide"
         obj.delta_timestamps = None
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_codec()

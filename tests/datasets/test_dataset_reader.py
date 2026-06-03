@@ -145,9 +145,86 @@ def test_image_transforms_are_applied(tmp_path, lerobot_dataset_factory):
     num_cameras = len(dataset.meta.camera_keys)
     if num_cameras > 0:
         assert transform_called["count"] >= 1
+def test_guide_image_transforms_applied_to_guide_keys(tmp_path, lerobot_dataset_factory):
+    """guide_image_transforms is applied to guide camera keys; image_transforms is skipped for them."""
+    regular_called = {"count": 0}
+    guide_called = {"count": 0}
+
+    def regular_transform(img):
+        regular_called["count"] += 1
+        return img
+
+    def guide_transform(img):
+        guide_called["count"] += 1
+        return img
+
+    # Use "phone" as the guide key (contains "phone"); "laptop" is the regular camera.
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds",
+        total_episodes=1,
+        total_frames=5,
+        use_videos=False,
+        image_transforms=regular_transform,
+        guide_image_transforms=guide_transform,
+        guide_key_contains="phone",
+    )
+    _ = dataset[0]
+
+    # Regular transform must have been called (for "laptop" only)
+    assert regular_called["count"] >= 1, "Regular transform was not called for non-guide keys"
+    # Guide transform must have been called (for "phone")
+    assert guide_called["count"] >= 1, "Guide transform was not called for guide keys"
 
 
-# ── File paths ───────────────────────────────────────────────────────
+def test_guide_image_transforms_default_no_augmentation(tmp_path, lerobot_dataset_factory):
+    """By default guide_image_transforms=None so guide keys receive no transform."""
+    guide_called = {"count": 0}
+
+    def guide_transform(img):
+        guide_called["count"] += 1
+        return img
+
+    # guide_image_transforms is not provided — default is None (no augmentation)
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds",
+        total_episodes=1,
+        total_frames=5,
+        use_videos=False,
+    )
+    _ = dataset[0]
+
+    # No guide transform should have been called since none was provided
+    assert guide_called["count"] == 0
+
+
+def test_image_transforms_not_applied_to_guide_keys_when_guide_transform_set(
+    tmp_path, lerobot_dataset_factory
+):
+    """When guide_image_transforms is set, image_transforms must NOT touch guide keys."""
+    regular_called_for = {"count": 0}
+
+    def regular_transform(img):
+        regular_called_for["count"] += 1
+        return img
+
+    # Treat "phone" as guide stream; provide guide_image_transforms=None (no-op for guide).
+    # regular_transform should be called only once — for the non-guide "laptop" camera.
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds",
+        total_episodes=1,
+        total_frames=5,
+        use_videos=False,
+        image_transforms=regular_transform,
+        guide_image_transforms=None,  # no augmentation for guide key
+        guide_key_contains="phone",
+    )
+    _ = dataset[0]
+
+    # regular_transform called exactly once: only for "laptop", not for "phone"
+    assert regular_called_for["count"] == 1
+
+
+
 
 
 def test_get_episodes_file_paths_returns_data_paths(tmp_path, lerobot_dataset_factory):

@@ -51,6 +51,8 @@ class DatasetReader:
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
         return_uint8: bool = False,
+        guide_image_transforms: Callable | None = None,
+        guide_key_contains: str = "guide",
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -67,7 +69,15 @@ class DatasetReader:
             delta_timestamps: Optional dict mapping feature keys to lists of
                 relative timestamp offsets for temporal context windows.
             image_transforms: Optional torchvision v2 transform applied to
-                visual features.
+                non-guide visual features.
+            return_uint8: When True frames are returned as uint8 tensors.
+            guide_image_transforms: Optional torchvision v2 transform applied
+                to guide camera streams instead of ``image_transforms``.
+                Defaults to ``None`` (no augmentation for guide keys).
+            guide_key_contains: Substring used to identify guide camera keys.
+                Any camera key whose name contains this string is treated as a
+                guide stream and receives ``guide_image_transforms``.
+                Defaults to ``"guide"``.
         """
         self._meta = meta
         self.root = root
@@ -76,6 +86,8 @@ class DatasetReader:
         self._video_backend = video_backend
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
+        self._guide_image_transforms = guide_image_transforms
+        self._guide_key_contains = guide_key_contains
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -286,10 +298,14 @@ class DatasetReader:
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
-        if self._image_transforms is not None:
+        if self._image_transforms is not None or self._guide_image_transforms is not None:
             image_keys = self._meta.camera_keys
             for cam in image_keys:
-                item[cam] = self._image_transforms(item[cam])
+                if self._guide_key_contains and self._guide_key_contains in cam:
+                    if self._guide_image_transforms is not None:
+                        item[cam] = self._guide_image_transforms(item[cam])
+                elif self._image_transforms is not None:
+                    item[cam] = self._image_transforms(item[cam])
 
         # Add task as a string
         task_idx = item["task_index"].item()

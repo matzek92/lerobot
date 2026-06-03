@@ -252,6 +252,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
         return_uint8: bool = False,
+        guide_image_transforms: Callable | None = None,
+        guide_key_contains: str = "guide",
     ):
         """Initialize a StreamingLeRobotDataset.
 
@@ -280,6 +282,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.streaming_from_local = root is not None
 
         self.image_transforms = image_transforms
+        self.guide_image_transforms = guide_image_transforms
+        self.guide_key_contains = guide_key_contains
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
@@ -500,10 +504,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             )
             video_frames = self._query_videos(query_timestamps, ep_idx)
 
-            if self.image_transforms is not None:
+            if self.image_transforms is not None or self.guide_image_transforms is not None:
                 image_keys = self.meta.camera_keys
                 for cam in image_keys:
-                    video_frames[cam] = self.image_transforms(video_frames[cam])
+                    if self.guide_key_contains and self.guide_key_contains in cam:
+                        if self.guide_image_transforms is not None:
+                            video_frames[cam] = self.guide_image_transforms(video_frames[cam])
+                    elif self.image_transforms is not None:
+                        video_frames[cam] = self.image_transforms(video_frames[cam])
 
             updates.append(video_frames)
 
