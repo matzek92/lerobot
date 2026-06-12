@@ -54,6 +54,16 @@ class ACTConfig(PreTrainedConfig):
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        resize_shape: (H, W) shape to resize images to as a preprocessing step before the vision
+            backbone. If None, no resizing is done and the original image resolution is used.
+        crop_ratio: Ratio in (0, 1] used to derive the crop size from resize_shape
+            (crop_h = int(resize_shape[0] * crop_ratio), likewise for width).
+            Set to 1.0 to disable cropping. Only takes effect when resize_shape is not None.
+        crop_shape: (H, W) shape to crop images to. When resize_shape is set and crop_ratio < 1.0,
+            this is computed automatically. Can also be set directly for legacy configs that use
+            crop-only (without resize). If None and no derivation applies, no cropping is done.
+        crop_is_random: Whether the crop should be random at training time (it's always a center
+            crop in eval mode).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
@@ -96,6 +106,11 @@ class ACTConfig(PreTrainedConfig):
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    # (H, W) to resize input images to before the vision backbone. None = use native resolution.
+    resize_shape: tuple[int, int] | None = None
+    crop_ratio: float = 1.0
+    crop_shape: tuple[int, int] | None = None
+    crop_is_random: bool = True
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
@@ -135,6 +150,22 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
+        if self.resize_shape is not None and (
+            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
+        ):
+            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
+        if not (0 < self.crop_ratio <= 1.0):
+            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
+        if self.resize_shape is not None:
+            if self.crop_ratio < 1.0:
+                self.crop_shape = (
+                    int(self.resize_shape[0] * self.crop_ratio),
+                    int(self.resize_shape[1] * self.crop_ratio),
+                )
+            else:
+                self.crop_shape = None
+        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
+            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
@@ -162,6 +193,14 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+        if self.resize_shape is None and self.crop_shape is not None:
+            for key, image_ft in self.image_features.items():
+                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                    raise ValueError(
+                        f"`crop_shape` should fit within the image shapes. Got {self.crop_shape} "
+                        f"for `crop_shape` and {image_ft.shape} for `{key}`."
+                    )
 
     @property
     def observation_delta_indices(self) -> None:

@@ -332,6 +332,23 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+            # Optional resizing of input images before the backbone.
+            if config.resize_shape is not None:
+                self.resize = torchvision.transforms.Resize(config.resize_shape)
+            else:
+                self.resize = None
+
+            crop_shape = config.crop_shape
+            if crop_shape is not None:
+                self.do_crop = True
+                self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
+                if config.crop_is_random:
+                    self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+                else:
+                    self.maybe_random_crop = self.center_crop
+            else:
+                self.do_crop = False
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -471,6 +488,13 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
+                if self.resize is not None:
+                    img = self.resize(img)
+                if self.do_crop:
+                    if self.training:
+                        img = self.maybe_random_crop(img)
+                    else:
+                        img = self.center_crop(img)
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)

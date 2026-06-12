@@ -20,6 +20,8 @@ from pathlib import Path
 import einops
 import pytest
 import torch
+import torchvision
+from lerobot.policies.act.modeling_act import ACT, ACTTemporalEnsembler
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
@@ -34,7 +36,6 @@ from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.utils import close_envs, preprocess_observation
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
 from lerobot.policies.factory import (
     get_policy_class,
     make_policy,
@@ -51,6 +52,71 @@ from lerobot.utils.random_utils import seeded_context
 from lerobot.utils.utils import cycle
 from tests.artifacts.policies.save_policy_to_safetensors import get_policy_stats
 from tests.utils import DEVICE, require_cpu, require_env, require_x86_64_kernel
+
+
+def test_act_resize_and_crop_preprocessing():
+    input_features = {
+        f"{OBS_IMAGES}.cam": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+    }
+    output_features = {
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+    }
+    config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        resize_shape=(240, 320),
+        crop_ratio=0.5,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=4,
+        n_action_steps=4,
+        dim_model=64,
+        dim_feedforward=128,
+        n_encoder_layers=1,
+        n_heads=4,
+    )
+
+    assert config.crop_shape == (120, 160)
+
+    model = ACT(config)
+
+    assert isinstance(model.resize, torchvision.transforms.Resize)
+    assert model.do_crop is True
+    assert isinstance(model.center_crop, torchvision.transforms.CenterCrop)
+    assert isinstance(model.maybe_random_crop, torchvision.transforms.RandomCrop)
+
+    image = torch.arange(3 * 480 * 640, dtype=torch.float32).reshape(1, 3, 480, 640)
+
+    model.train()
+    with seeded_context(0):
+        train_crop = model.maybe_random_crop(model.resize(image))
+
+    model.eval()
+    eval_crop = model.center_crop(model.resize(image))
+
+    assert train_crop.shape[-2:] == config.crop_shape
+    assert eval_crop.shape[-2:] == config.crop_shape
+    assert not torch.equal(train_crop, eval_crop)
+
+    config_no_random_crop = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        crop_shape=(120, 160),
+        crop_is_random=False,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=4,
+        n_action_steps=4,
+        dim_model=64,
+        dim_feedforward=128,
+        n_encoder_layers=1,
+        n_heads=4,
+    )
+    model_no_random_crop = ACT(config_no_random_crop)
+
+    assert model_no_random_crop.do_crop is True
+    assert isinstance(model_no_random_crop.maybe_random_crop, torchvision.transforms.CenterCrop)
 
 # Policies that require optional heavy dependencies to instantiate
 _POLICY_REQUIRED_PACKAGES: dict[str, tuple[str, ...]] = {
