@@ -201,21 +201,22 @@ class DiffusionModel(nn.Module):
             # common in diffusion inference.
             self.unet = torch.compile(self.unet, mode=config.compile_mode)
 
-        self.noise_scheduler = _make_noise_scheduler(
-            config.noise_scheduler_type,
-            num_train_timesteps=config.num_train_timesteps,
-            beta_start=config.beta_start,
-            beta_end=config.beta_end,
-            beta_schedule=config.beta_schedule,
-            clip_sample=config.clip_sample,
-            clip_sample_range=config.clip_sample_range,
-            prediction_type=config.prediction_type,
-        )
+        if config.is_diffusion:
+            self.noise_scheduler = _make_noise_scheduler(
+                config.noise_scheduler_type,
+                num_train_timesteps=config.num_train_timesteps,
+                beta_start=config.beta_start,
+                beta_end=config.beta_end,
+                beta_schedule=config.beta_schedule,
+                clip_sample=config.clip_sample,
+                clip_sample_range=config.clip_sample_range,
+                prediction_type=config.prediction_type,
+            )
 
-        if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
-        else:
-            self.num_inference_steps = config.num_inference_steps
+            if config.num_inference_steps is None:
+                self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+            else:
+                self.num_inference_steps = config.num_inference_steps
 
     # ========= inference  ============
     def conditional_sample(
@@ -225,6 +226,14 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
+        if self.config.is_flow_matching:
+            return self._flow_matching_conditional_sample(
+                batch_size=batch_size,
+                global_cond=global_cond,
+                generator=generator,
+                noise=noise,
+            )
+
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -253,6 +262,76 @@ class DiffusionModel(nn.Module):
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
         return sample
+
+    def _sample_flow_matching_timesteps(self, batch_size: int, device: torch.device) -> Tensor:
+        if self.config.timestep_sampling_strategy == "uniform":
+            return torch.rand(batch_size, device=device)
+
+        if self.config.timestep_sampling_strategy == "beta":
+            beta_dist = torch.distributions.Beta(
+                self.config.timestep_sampling_alpha,
+                self.config.timestep_sampling_beta,
+            )
+            u = beta_dist.sample((batch_size,)).to(device)
+            return self.config.timestep_sampling_s * (1.0 - u)
+
+        raise ValueError(f"Unknown timestep sampling strategy: {self.config.timestep_sampling_strategy}")
+
+    def _flow_matching_euler_integrate(self, x: Tensor, time_grid: Tensor, global_cond: Tensor | None) -> Tensor:
+        for idx in range(len(time_grid) - 1):
+            t_scalar = time_grid[idx].item()
+            dt = (time_grid[idx + 1] - time_grid[idx]).item()
+            t_batch = torch.full((x.shape[0],), t_scalar, dtype=x.dtype, device=x.device)
+            with torch.no_grad():
+                velocity = self.unet(x, t_batch, global_cond=global_cond)
+            x = x + dt * velocity
+        return x
+
+    def _flow_matching_rk4_integrate(self, x: Tensor, time_grid: Tensor, global_cond: Tensor | None) -> Tensor:
+        def dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
+            t_batch = torch.full((x_val.shape[0],), t_scalar, dtype=x_val.dtype, device=x_val.device)
+            with torch.no_grad():
+                return self.unet(x_val, t_batch, global_cond=global_cond)
+
+        for idx in range(len(time_grid) - 1):
+            t = time_grid[idx].item()
+            dt = (time_grid[idx + 1] - time_grid[idx]).item()
+
+            k1 = dynamics(x, t)
+            k2 = dynamics(x + dt * k1 / 2, t + dt / 2)
+            k3 = dynamics(x + dt * k2 / 2, t + dt / 2)
+            k4 = dynamics(x + dt * k3, t + dt)
+            x = x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        return x
+
+    def _flow_matching_conditional_sample(
+        self,
+        batch_size: int,
+        global_cond: Tensor | None = None,
+        generator: torch.Generator | None = None,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        x = (
+            noise
+            if noise is not None
+            else torch.randn(
+                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+        )
+
+        time_grid = torch.linspace(0, 1, self.config.num_integration_steps + 1, device=device, dtype=dtype)
+        if self.config.integration_method == "euler":
+            return self._flow_matching_euler_integrate(x, time_grid, global_cond)
+        if self.config.integration_method == "rk4":
+            return self._flow_matching_rk4_integrate(x, time_grid, global_cond)
+        raise ValueError(f"Unknown integration method: {self.config.integration_method}")
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
@@ -343,6 +422,28 @@ class DiffusionModel(nn.Module):
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        if self.config.is_flow_matching:
+            trajectory = batch[ACTION]
+            batch_size = trajectory.shape[0]
+            noise = torch.randn_like(trajectory)
+            timesteps = self._sample_flow_matching_timesteps(batch_size, trajectory.device)
+            timesteps_expanded = timesteps.view(-1, 1, 1)
+
+            noisy_trajectory = (
+                timesteps_expanded * trajectory
+                + (1 - (1 - self.config.sigma_min) * timesteps_expanded) * noise
+            )
+            target_velocity = trajectory - (1 - self.config.sigma_min) * noise
+
+            pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+            loss = F.mse_loss(pred, target_velocity, reduction="none")
+
+            if self.config.do_mask_loss_for_padding:
+                in_episode_bound = ~batch["action_is_pad"]
+                loss = loss * in_episode_bound.unsqueeze(-1)
+
+            return loss.mean()
 
         # Forward diffusion.
         trajectory = batch[ACTION]

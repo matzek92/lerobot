@@ -15,8 +15,10 @@
 # limitations under the License.
 
 import logging
+import re
 import time
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -26,12 +28,48 @@ from lerobot.motors.feetech import (
 )
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.import_utils import _serial_available, require_package
+
+if TYPE_CHECKING or _serial_available:
+    import serial
+else:
+    serial = None  # type: ignore[assignment]
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from .config_so_follower import SOFollowerRobotConfig
 
 logger = logging.getLogger(__name__)
+
+_SENSOR_VALUE_PATTERNS = {
+    "live": re.compile(r"ADC_live:\s*([-+]?\d+(?:\.\d+)?)"),
+    "mean10": re.compile(r"ADC_mean10:\s*([-+]?\d+(?:\.\d+)?)"),
+    "dmean": re.compile(r"dMean:\s*([-+]?\d+(?:\.\d+)?)"),
+}
+
+
+def _parse_sensor_value(line: bytes, mode: str) -> float | None:
+    text = line.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return None
+
+    pattern = _SENSOR_VALUE_PATTERNS.get(mode)
+    if pattern is not None:
+        match = pattern.search(text)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+
+    # Fallback: first floating-point token in the line.
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if match is None:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 class SOFollower(Robot):
@@ -46,6 +84,17 @@ class SOFollower(Robot):
     def __init__(self, config: SOFollowerRobotConfig):
         super().__init__(config)
         self.config = config
+        self._sensor_serial = None
+        self._sensor_last_value = float(config.sensor_default_value)
+
+        valid_modes = set(_SENSOR_VALUE_PATTERNS)
+        if self.config.sensor_value_mode not in valid_modes:
+            raise ValueError(
+                f"sensor_value_mode must be one of {sorted(valid_modes)}. Got '{self.config.sensor_value_mode}'."
+            )
+
+        if self.config.sensor_enabled and not self.config.sensor_port:
+            raise ValueError("sensor_port must be set when sensor_enabled=True.")
         # choose normalization mode depending on config if available
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
@@ -74,7 +123,10 @@ class SOFollower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        features = {**self._motors_ft, **self._cameras_ft}
+        if self.config.sensor_enabled:
+            features[self.config.sensor_feature_name] = float
+        return features
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -82,7 +134,68 @@ class SOFollower(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+        motors_and_cameras_connected = self.bus.is_connected and all(
+            cam.is_connected for cam in self.cameras.values()
+        )
+        if not self.config.sensor_enabled:
+            return motors_and_cameras_connected
+        return motors_and_cameras_connected and self._sensor_serial is not None and self._sensor_serial.is_open
+
+    def _connect_sensor_if_enabled(self) -> None:
+        if not self.config.sensor_enabled:
+            return
+
+        require_package("pyserial", extra="pyserial-dep", import_name="serial")
+        try:
+            self._sensor_serial = serial.Serial(
+                self.config.sensor_port,
+                self.config.sensor_baud_rate,
+                timeout=self.config.sensor_timeout_s,
+            )
+            self._sensor_serial.reset_input_buffer()
+            logger.info(
+                "Connected optional analog sensor on %s (%d baud)",
+                self.config.sensor_port,
+                self.config.sensor_baud_rate,
+            )
+        except Exception as exc:
+            self._sensor_serial = None
+            msg = (
+                f"Failed to connect optional sensor on '{self.config.sensor_port}': {exc}. "
+                "Continuing without sensor."
+            )
+            if self.config.sensor_strict:
+                raise ConnectionError(msg) from exc
+            logger.warning(msg)
+
+    def _read_sensor_value(self) -> float:
+        if not self.config.sensor_enabled or self._sensor_serial is None:
+            return self._sensor_last_value
+
+        try:
+            last_value = None
+            while self._sensor_serial.in_waiting > 0:
+                line = self._sensor_serial.readline()
+                if not line:
+                    break
+                parsed = _parse_sensor_value(line, self.config.sensor_value_mode)
+                if parsed is not None:
+                    last_value = parsed
+
+            if last_value is None:
+                line = self._sensor_serial.readline()
+                if line:
+                    last_value = _parse_sensor_value(line, self.config.sensor_value_mode)
+
+            if last_value is not None:
+                self._sensor_last_value = last_value
+
+            return self._sensor_last_value
+        except Exception as exc:
+            if self.config.sensor_strict:
+                raise RuntimeError(f"Sensor read failed: {exc}") from exc
+            logger.debug("Optional sensor read failed (%s), reusing last value", exc)
+            return self._sensor_last_value
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -100,6 +213,8 @@ class SOFollower(Robot):
 
         for cam in self.cameras.values():
             cam.connect()
+
+        self._connect_sensor_if_enabled()
 
         self.configure()
         logger.info(f"{self} connected.")
@@ -190,6 +305,9 @@ class SOFollower(Robot):
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
+        if self.config.sensor_enabled:
+            obs_dict[self.config.sensor_feature_name] = self._read_sensor_value()
+
         return obs_dict
 
     @check_if_not_connected
@@ -222,6 +340,12 @@ class SOFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
+        if self._sensor_serial is not None:
+            try:
+                self._sensor_serial.close()
+            finally:
+                self._sensor_serial = None
+
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()

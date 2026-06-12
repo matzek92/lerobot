@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_IMAGE, OBS_STATE
@@ -490,6 +491,129 @@ def copy_episodes(
         f"{write_target.meta.total_frames} frames"
     )
     return write_target
+
+
+def _resize_batched_chw(frames: np.ndarray, resize_shape: tuple[int, int], mode: str) -> np.ndarray:
+    """Resize a batch of CHW frames to a target (H, W)."""
+    frames_tensor = torch.from_numpy(frames)
+    interpolate_kwargs = {}
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        interpolate_kwargs["align_corners"] = False
+    resized = F.interpolate(frames_tensor, size=resize_shape, mode=mode, **interpolate_kwargs)
+    return resized.numpy()
+
+
+def resize_video_streams(
+    dataset: LeRobotDataset,
+    resize_shape: tuple[int, int],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    vcodec: str | None = None,
+    interpolation_mode: str = "bilinear",
+) -> LeRobotDataset:
+    """Resize video streams in a dataset and write a new dataset.
+
+    Args:
+        dataset: Source dataset.
+        resize_shape: Target (height, width).
+        output_dir: Target dataset path.
+        repo_id: Target dataset repo id.
+        vcodec: Video codec for output videos. If None, source codec is reused when possible.
+        interpolation_mode: Interpolation mode passed to torch interpolate.
+
+    Returns:
+        New dataset with resized video streams.
+    """
+    if len(resize_shape) != 2 or resize_shape[0] <= 0 or resize_shape[1] <= 0:
+        raise ValueError(f"resize_shape must be (height, width) with positive integers. Got {resize_shape}")
+
+    if not dataset.meta.video_keys:
+        raise ValueError("Dataset has no video streams to resize")
+
+    supported_modes = {"nearest", "nearest-exact", "bilinear", "bicubic", "area"}
+    if interpolation_mode not in supported_modes:
+        raise ValueError(
+            f"Unsupported interpolation_mode '{interpolation_mode}'. Supported: {sorted(supported_modes)}"
+        )
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_resized"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    user_features = {k: v for k, v in dataset.meta.features.items() if k not in DEFAULT_FEATURES}
+    resized_h, resized_w = int(resize_shape[0]), int(resize_shape[1])
+
+    new_features: dict[str, dict] = {}
+    for feature_key, feature_info in user_features.items():
+        if feature_info.get("dtype") == "video":
+            feature_shape = feature_info.get("shape")
+            if feature_shape is None or len(feature_shape) < 3:
+                raise ValueError(f"Feature '{feature_key}' has invalid shape metadata: {feature_shape}")
+            channel_dim = int(feature_shape[2])
+            resized_feature_info = dict(feature_info)
+            resized_feature_info["shape"] = [resized_h, resized_w, channel_dim]
+            new_features[feature_key] = resized_feature_info
+        else:
+            new_features[feature_key] = feature_info
+
+    resolved_vcodec = vcodec if vcodec is not None else _infer_source_vcodec(dataset)
+    target_dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        vcodec=resolved_vcodec,
+    )
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+    dataset._ensure_hf_dataset_loaded()
+
+    for episode_idx in tqdm(range(dataset.meta.total_episodes), desc="Resizing video streams"):
+        ep_meta = dataset.meta.episodes[episode_idx]
+        from_idx = ep_meta["dataset_from_index"]
+        to_idx = ep_meta["dataset_to_index"]
+        ep_length = to_idx - from_idx
+
+        video_frames: dict[str, np.ndarray] = {}
+        for vid_key in dataset.meta.video_keys:
+            from_ts = ep_meta[f"videos/{vid_key}/from_timestamp"]
+            timestamps = [from_ts + i / dataset.fps for i in range(ep_length)]
+            video_path = dataset.root / dataset.meta.get_video_file_path(episode_idx, vid_key)
+            frames_tensor = decode_video_frames(
+                video_path, timestamps, dataset.tolerance_s, dataset.video_backend
+            )
+            frames = frames_tensor.numpy()  # (N, C, H, W), float32
+            frames = _resize_batched_chw(frames, (resized_h, resized_w), interpolation_mode)
+            video_frames[vid_key] = frames
+
+        for i in range(ep_length):
+            abs_idx = from_idx + i
+            item = dataset.hf_dataset[abs_idx]
+
+            frame: dict = {}
+            frame["task"] = dataset.meta.tasks.iloc[item["task_index"].item()].name
+
+            for vid_key in dataset.meta.video_keys:
+                frame[vid_key] = video_frames[vid_key][i].transpose(1, 2, 0)
+
+            for feature_key, feature_info in user_features.items():
+                if feature_info["dtype"] == "video":
+                    continue
+                if feature_info["dtype"] == "image":
+                    frame[feature_key] = (item[feature_key] * 255).byte().permute(1, 2, 0).numpy()
+                else:
+                    frame[feature_key] = item[feature_key].numpy()
+
+            target_dataset.add_frame(frame)
+
+        target_dataset.save_episode()
+
+    target_dataset.finalize()
+    target_dataset._ensure_hf_dataset_loaded()
+    return target_dataset
 
 
 def trim_episodes(

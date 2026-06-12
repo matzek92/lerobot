@@ -302,6 +302,13 @@ Copy episodes and append to an existing dataset:
         --operation.type copy_episodes \
         --operation.episode_indices "[0, 2, 5]" \
         --operation.append_to_repo_id target/existing_dataset
+
+Resize all video streams to 320x240:
+    lerobot-edit-dataset \
+        --repo_id my_user/my_dataset \
+        --new_repo_id my_user/my_dataset_320x240 \
+        --operation.type resize_videos \
+        --operation.resize_shape "[240, 320]"
 Recompute dataset statistics:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -348,6 +355,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     recompute_stats,
     remove_feature,
+    resize_video_streams,
     rename_features,
     resize_videos,
     split_dataset,
@@ -454,6 +462,14 @@ class MergeConfig(OperationConfig):
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("resize_videos")
+@dataclass
+class ResizeVideosConfig(OperationConfig):
+    resize_shape: tuple[int, int] | None = None
+    interpolation_mode: str = "bilinear"
+    vcodec: str | None = None
 
 
 @OperationConfig.register_subclass("rename_features")
@@ -1009,6 +1025,46 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
 
     logging.info(f"Dataset saved to {output_dir}")
     logging.info(f"Remaining features: {list(new_dataset.meta.features.keys())}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_resize_videos(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ResizeVideosConfig):
+        raise ValueError("Operation config must be ResizeVideosConfig")
+
+    if cfg.operation.resize_shape is None:
+        raise ValueError("operation.resize_shape must be specified for resize_videos operation")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+
+    if output_dir == dataset.root:
+        dataset.root = dataset.root.with_name(dataset.root.name + "_old")
+
+    logging.info(
+        "Resizing all video streams to (H=%d, W=%d)",
+        cfg.operation.resize_shape[0],
+        cfg.operation.resize_shape[1],
+    )
+    new_dataset = resize_video_streams(
+        dataset=dataset,
+        resize_shape=cfg.operation.resize_shape,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        interpolation_mode=cfg.operation.interpolation_mode,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
 
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
@@ -1661,6 +1717,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_remove_feature(cfg)
     elif operation_type == "rename_features":
         handle_rename_features(cfg)
+    elif operation_type == "resize_videos":
+        handle_resize_videos(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
