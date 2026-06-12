@@ -143,6 +143,7 @@ def update_meta_data(
     meta_idx,
     data_idx,
     videos_idx,
+    meta_src_key: tuple[int, int] | None = None,
 ):
     """Updates metadata DataFrame with new chunk, file, and timestamp indices.
 
@@ -163,8 +164,16 @@ def update_meta_data(
         pd.DataFrame: Updated DataFrame with adjusted indices and timestamps.
     """
 
-    df["meta/episodes/chunk_index"] = df["meta/episodes/chunk_index"] + meta_idx["chunk"]
-    df["meta/episodes/file_index"] = df["meta/episodes/file_index"] + meta_idx["file"]
+    # Rewrite metadata file indices to the actual destination metadata file.
+    # This avoids carrying stale in-row indices from previously merged sources.
+    meta_src_to_dst = meta_idx.get("src_to_dst", {})
+    if meta_src_key is not None and meta_src_key in meta_src_to_dst:
+        dst_chunk, dst_file = meta_src_to_dst[meta_src_key]
+        df["meta/episodes/chunk_index"] = dst_chunk
+        df["meta/episodes/file_index"] = dst_file
+    else:
+        df["meta/episodes/chunk_index"] = df["meta/episodes/chunk_index"] + meta_idx["chunk"]
+        df["meta/episodes/file_index"] = df["meta/episodes/file_index"] + meta_idx["file"]
 
     # Update data file indices using source-to-destination mapping
     # This is critical for handling datasets that are already results of a merge
@@ -576,6 +585,17 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
         if not src_path.exists():
             logging.warning(f"Skipping missing metadata file: {src_path}")
             continue
+
+        # Resolve destination metadata file before rewriting in-row metadata indices.
+        dst_chunk, dst_file = resolve_parquet_destination_indices(
+            src_path=src_path,
+            idx=meta_idx,
+            max_mb=DEFAULT_DATA_FILE_SIZE_IN_MB,
+            chunk_size=DEFAULT_CHUNK_SIZE,
+            default_path=DEFAULT_EPISODES_PATH,
+            aggr_root=dst_meta.root,
+        )
+        meta_idx.setdefault("src_to_dst", {})[(chunk_idx, file_idx)] = (dst_chunk, dst_file)
         
         df = pd.read_parquet(src_path)
         df = update_meta_data(
@@ -584,9 +604,10 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             meta_idx,
             data_idx,
             videos_idx,
+            meta_src_key=(chunk_idx, file_idx),
         )
 
-        meta_idx, _ = append_or_create_parquet_file(
+        meta_idx, written_dst = append_or_create_parquet_file(
             df,
             src_path,
             meta_idx,
@@ -596,6 +617,14 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             contains_images=False,
             aggr_root=dst_meta.root,
         )
+
+        if written_dst != (dst_chunk, dst_file):
+            logging.warning(
+                "Metadata destination mismatch for %s: expected %s, wrote %s",
+                src_path,
+                (dst_chunk, dst_file),
+                written_dst,
+            )
 
     # Increment latest_duration by the total duration added from this source dataset
     for k in videos_idx:
@@ -672,6 +701,29 @@ def append_or_create_parquet_file(
         final_df.to_parquet(target_path)
 
     return idx, (dst_chunk, dst_file)
+
+
+def resolve_parquet_destination_indices(
+    src_path: Path,
+    idx: dict[str, int],
+    max_mb: float,
+    chunk_size: int,
+    default_path: str,
+    aggr_root: Path,
+) -> tuple[int, int]:
+    """Resolve destination chunk/file for a parquet append without writing data."""
+    dst_chunk, dst_file = idx["chunk"], idx["file"]
+    dst_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
+
+    if not dst_path.exists():
+        return dst_chunk, dst_file
+
+    src_size = get_parquet_file_size_in_mb(src_path)
+    dst_size = get_parquet_file_size_in_mb(dst_path)
+    if dst_size + src_size >= max_mb:
+        return update_chunk_file_indices(dst_chunk, dst_file, chunk_size)
+
+    return dst_chunk, dst_file
 
 
 def finalize_aggregation(aggr_meta, all_metadata):

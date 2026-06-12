@@ -324,6 +324,22 @@ Recompute stats for relative actions and push to hub:
         --operation.num_workers 4 \
         --push_to_hub true
 
+Check dataset consistency only (dry-run):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --root /path/to/pusht \
+        --operation.type repair_inconsistencies \
+        --operation.dry_run true
+
+Repair dataset inconsistencies into a new dataset:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --root /path/to/pusht \
+        --new_repo_id lerobot/pusht_repaired \
+        --new_root /path/to/pusht_repaired \
+        --operation.type repair_inconsistencies \
+        --operation.overwrite_output true
+
 Using JSON config file:
     lerobot-edit-dataset \
         --config_path path/to/edit_config.json
@@ -343,6 +359,7 @@ from lerobot.datasets import LeRobotDataset
 
 from lerobot.datasets.dataset_tools import (
     add_black_stream,
+    check_dataset_inconsistencies,
     add_guide_stream,
     add_sam2_initial_segment,
     add_sam2_stream,
@@ -353,6 +370,7 @@ from lerobot.datasets.dataset_tools import (
     delete_episodes,
     merge_datasets,
     modify_tasks,
+    repair_dataset_inconsistencies,
     recompute_stats,
     remove_feature,
     resize_video_streams,
@@ -464,12 +482,12 @@ class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
 
 
-@OperationConfig.register_subclass("resize_videos")
-@dataclass
-class ResizeVideosConfig(OperationConfig):
-    resize_shape: tuple[int, int] | None = None
-    interpolation_mode: str = "bilinear"
-    vcodec: str | None = None
+# @OperationConfig.register_subclass("resize_videos")
+# @dataclass
+# class ResizeVideosConfig(OperationConfig):
+#     resize_shape: tuple[int, int] | None = None
+#     interpolation_mode: str = "bilinear"
+#     vcodec: str | None = None
 
 
 @OperationConfig.register_subclass("rename_features")
@@ -626,6 +644,19 @@ class RecomputeStatsConfig(OperationConfig):
     relative_exclude_joints: list[str] | None = None
     chunk_size: int = 50
     num_workers: int = 0
+
+
+@OperationConfig.register_subclass("repair_inconsistencies")
+@dataclass
+class RepairInconsistenciesConfig(OperationConfig):
+    # If True, only report inconsistencies and do not write output dataset.
+    dry_run: bool = False
+    # Replace output directory if it already exists.
+    overwrite_output: bool = False
+    # Recompute stats.json after repairing the dataset.
+    recompute_stats_after: bool = True
+    # If recomputing stats, skip image/video features.
+    skip_image_video_stats: bool = True
 
 
 @OperationConfig.register_subclass("info")
@@ -1244,6 +1275,47 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
         dataset.push_to_hub()
 
 
+def handle_repair_inconsistencies(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RepairInconsistenciesConfig):
+        raise ValueError("Operation config must be RepairInconsistenciesConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    report = check_dataset_inconsistencies(dataset)
+    logging.info(f"Consistency report: {report}")
+
+    if cfg.operation.dry_run:
+        return
+
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+
+    repaired_dataset = repair_dataset_inconsistencies(
+        dataset,
+        output_repo_id=output_repo_id,
+        output_dir=output_dir,
+        dry_run=False,
+        overwrite_output=cfg.operation.overwrite_output,
+        recompute_stats_after=cfg.operation.recompute_stats_after,
+        skip_image_video_stats=cfg.operation.skip_image_video_stats,
+    )
+
+    if repaired_dataset is None:
+        return
+
+    logging.info(f"Repaired dataset saved to {output_dir}")
+    logging.info(
+        f"Episodes: {repaired_dataset.meta.total_episodes}, Frames: {repaired_dataset.meta.total_frames}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {repaired_dataset.repo_id}...")
+        repaired_dataset.push_to_hub()
+
+
 def _get_dataset_size(repo_path):
     import os
 
@@ -1735,6 +1807,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_add_sam3_stream(cfg)
     elif operation_type == "recompute_stats":
         handle_recompute_stats(cfg)
+    elif operation_type == "repair_inconsistencies":
+        handle_repair_inconsistencies(cfg)
     elif operation_type == "info":
         handle_info(cfg)
     else:

@@ -21,6 +21,7 @@ This module provides utilities for:
 - Splitting datasets into multiple smaller datasets
 - Adding/removing features from datasets
 - Merging datasets (wrapper around aggregate functionality)
+- Checking and repairing dataset consistency issues
 """
 
 import logging
@@ -1102,6 +1103,178 @@ def merge_datasets(
     )
 
     return merged_dataset
+
+
+def check_dataset_inconsistencies(dataset: LeRobotDataset) -> dict[str, object]:
+    """Check dataset references and metadata counters for common inconsistencies.
+
+    This validates that references stored in ``meta/episodes/*.parquet`` point to
+    existing metadata/data/video files in the dataset directory.
+
+    Args:
+        dataset: Dataset to inspect.
+
+    Returns:
+        A report dictionary with issue counts and missing reference details.
+    """
+    episodes = dataset.meta.episodes
+    total_episodes = len(episodes)
+
+    # Existing metadata parquet files by (chunk, file)
+    existing_meta_pairs: set[tuple[int, int]] = set()
+    for path in sorted((dataset.root / EPISODES_DIR).glob("chunk-*/file-*.parquet")):
+        chunk_idx = int(path.parent.name.replace("chunk-", ""))
+        file_idx = int(path.stem.replace("file-", ""))
+        existing_meta_pairs.add((chunk_idx, file_idx))
+
+    referenced_meta_pairs = set(
+        zip(
+            episodes["meta/episodes/chunk_index"],
+            episodes["meta/episodes/file_index"],
+            strict=False,
+        )
+    )
+    missing_meta_refs = sorted(p for p in referenced_meta_pairs if p not in existing_meta_pairs)
+
+    referenced_data_pairs = set(
+        zip(
+            episodes["data/chunk_index"],
+            episodes["data/file_index"],
+            strict=False,
+        )
+    )
+    missing_data_refs: list[tuple[int, int]] = []
+    for chunk_idx, file_idx in sorted(referenced_data_pairs):
+        path = dataset.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        if not path.exists():
+            missing_data_refs.append((chunk_idx, file_idx))
+
+    missing_video_refs: dict[str, list[tuple[int, int]]] = {}
+    for vid_key in dataset.meta.video_keys:
+        chunk_col = f"videos/{vid_key}/chunk_index"
+        file_col = f"videos/{vid_key}/file_index"
+        if chunk_col not in episodes.column_names or file_col not in episodes.column_names:
+            continue
+        referenced_video_pairs = set(zip(episodes[chunk_col], episodes[file_col], strict=False))
+        missing_pairs: list[tuple[int, int]] = []
+        for chunk_idx, file_idx in sorted(referenced_video_pairs):
+            path = dataset.root / dataset.meta.video_path.format(
+                video_key=vid_key,
+                chunk_index=chunk_idx,
+                file_index=file_idx,
+            )
+            if not path.exists():
+                missing_pairs.append((chunk_idx, file_idx))
+        if missing_pairs:
+            missing_video_refs[vid_key] = missing_pairs
+
+    info_total_episodes = int(dataset.meta.info.get("total_episodes", total_episodes))
+    episode_count_mismatch = info_total_episodes != total_episodes
+
+    inconsistency_count = (
+        len(missing_meta_refs)
+        + len(missing_data_refs)
+        + sum(len(v) for v in missing_video_refs.values())
+        + int(episode_count_mismatch)
+    )
+
+    return {
+        "is_consistent": inconsistency_count == 0,
+        "inconsistency_count": inconsistency_count,
+        "total_episodes": total_episodes,
+        "info_total_episodes": info_total_episodes,
+        "episode_count_mismatch": episode_count_mismatch,
+        "missing_meta_file_refs": missing_meta_refs,
+        "missing_data_file_refs": missing_data_refs,
+        "missing_video_file_refs": missing_video_refs,
+    }
+
+
+def repair_dataset_inconsistencies(
+    dataset: LeRobotDataset,
+    output_repo_id: str | None = None,
+    output_dir: str | Path | None = None,
+    *,
+    dry_run: bool = False,
+    overwrite_output: bool = False,
+    recompute_stats_after: bool = True,
+    skip_image_video_stats: bool = True,
+) -> LeRobotDataset | None:
+    """Repair a dataset by re-aggregating it into a new, normalized dataset.
+
+    The function first checks consistency, then re-runs aggregation with this
+    dataset as source so metadata/data/video references are rebuilt coherently.
+
+    Args:
+        dataset: Source dataset to validate and repair.
+        output_repo_id: Repo id for repaired output. Defaults to
+            ``f"{dataset.repo_id}_repaired"``.
+        output_dir: Root directory for repaired output.
+        dry_run: If True, only log issues and return None.
+        overwrite_output: If True, remove existing output directory before repair.
+        recompute_stats_after: If True, recompute stats for the repaired dataset.
+        skip_image_video_stats: Passed to ``recompute_stats``.
+
+    Returns:
+        Repaired dataset, or None in dry-run mode.
+    """
+    report = check_dataset_inconsistencies(dataset)
+    if report["is_consistent"]:
+        logging.info("Dataset is consistent. Re-aggregation is still available if you want normalization.")
+    else:
+        logging.warning("Detected %d inconsistencies in dataset metadata/references", report["inconsistency_count"])
+        logging.warning("Missing meta refs: %s", report["missing_meta_file_refs"])
+        logging.warning("Missing data refs: %s", report["missing_data_file_refs"])
+        logging.warning("Missing video refs: %s", report["missing_video_file_refs"])
+
+    if dry_run:
+        return None
+
+    if output_repo_id is None:
+        output_repo_id = f"{dataset.repo_id}_repaired"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / output_repo_id
+
+    if output_dir.exists():
+        if not overwrite_output:
+            raise FileExistsError(
+                f"Output directory already exists: {output_dir}. "
+                "Set overwrite_output=True to replace it."
+            )
+        shutil.rmtree(output_dir)
+
+    aggregate_datasets(
+        repo_ids=[dataset.repo_id],
+        aggr_repo_id=output_repo_id,
+        roots=[dataset.root],
+        aggr_root=output_dir,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+        chunk_size=dataset.meta.chunks_size,
+    )
+
+    repaired_dataset = LeRobotDataset(
+        repo_id=output_repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    if recompute_stats_after:
+        repaired_dataset = recompute_stats(
+            repaired_dataset,
+            skip_image_video=skip_image_video_stats,
+        )
+
+    repaired_report = check_dataset_inconsistencies(repaired_dataset)
+    if not repaired_report["is_consistent"]:
+        logging.warning(
+            "Repaired dataset still has %d inconsistencies: %s",
+            repaired_report["inconsistency_count"],
+            repaired_report,
+        )
+
+    return repaired_dataset
 
 
 def modify_features(
