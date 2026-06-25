@@ -35,6 +35,9 @@ class DatasetConfig:
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
+    # If True, video decoding failures are treated as recoverable and the next sample is used.
+    # If False, decoding failures raise and stop training.
+    skip_video_decode_errors: bool = False
     # When True, video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False

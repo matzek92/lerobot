@@ -56,6 +56,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        skip_video_decode_errors: bool = False,
         return_uint8: bool = False,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
@@ -175,6 +176,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            skip_video_decode_errors (bool, optional): If True, log a warning and retry with the next sample when
+                a video decode error happens. If False (default), raise the decode error immediately.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
             vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
@@ -203,6 +206,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_codec()
+        self._skip_video_decode_errors = skip_video_decode_errors
         self._return_uint8 = return_uint8
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
@@ -227,6 +231,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             video_backend=self._video_backend,
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
+            skip_video_decode_errors=self._skip_video_decode_errors,
             return_uint8=self._return_uint8,
         )
 
@@ -291,6 +296,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 video_backend=self._video_backend,
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
+                skip_video_decode_errors=self._skip_video_decode_errors,
                 return_uint8=self._return_uint8,
             )
         return self.reader

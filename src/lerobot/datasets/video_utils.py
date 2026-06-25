@@ -349,7 +349,14 @@ def decode_video_frames_torchcodec(
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
     # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    try:
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+        # print(len(frame_indices))
+    except Exception as e:
+        print(f"Error retrieving frames at indices {frame_indices} from video {video_path} with torchcodec: {e}"
+              f"\nThis might be due to synchronization issues with timestamps during data collection, "
+              f"or an issue with the video file itself.")
+        raise FrameTimestampError(f"Error retrieving frames: {e}")
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)

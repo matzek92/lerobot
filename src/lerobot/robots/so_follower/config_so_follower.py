@@ -49,8 +49,15 @@ class SOFollowerConfig:
     # Which value to extract from the incoming serial line.
     # Supported: "live" (ADC_live), "mean10" (ADC_mean10), "dmean" (dMean).
     sensor_value_mode: str = "mean10"
-    # Name of the extra observation scalar feature in the dataset/state vector.
+    # Which sensor channel(s) to record from the Arduino stream.
+    # Supported: "a0", "a1", "both".
+    sensor_channel: str = "a0"
+    # Name of the extra observation scalar feature in the dataset/state vector
+    # when sensor_channel is "a0" or "a1".
     sensor_feature_name: str = "sensor.a0_mean"
+    # Feature names used when sensor_channel is "both".
+    sensor_feature_name_a0: str = "sensor.a0_mean"
+    sensor_feature_name_a1: str = "sensor.a1_mean"
     # Used when no valid serial sample is available yet.
     sensor_default_value: float = 0.0
     # If True, fail on serial connection/read setup issues. If False, continue without sensor.

@@ -47,6 +47,21 @@ _SENSOR_VALUE_PATTERNS = {
     "dmean": re.compile(r"dMean:\s*([-+]?\d+(?:\.\d+)?)"),
 }
 
+_SENSOR_CHANNEL_PATTERNS = {
+    "live": {
+        "a0": re.compile(r"A0\s+ADC_live:\s*([-+]?\d+(?:\.\d+)?)"),
+        "a1": re.compile(r"A1\s+ADC_live:\s*([-+]?\d+(?:\.\d+)?)"),
+    },
+    "mean10": {
+        "a0": re.compile(r"A0\s+.*?ADC_mean10:\s*([-+]?\d+(?:\.\d+)?)"),
+        "a1": re.compile(r"A1\s+.*?ADC_mean10:\s*([-+]?\d+(?:\.\d+)?)"),
+    },
+    "dmean": {
+        "a0": re.compile(r"A0\s+.*?dMean:\s*([-+]?\d+(?:\.\d+)?)"),
+        "a1": re.compile(r"A1\s+.*?dMean:\s*([-+]?\d+(?:\.\d+)?)"),
+    },
+}
+
 
 def _parse_sensor_value(line: bytes, mode: str) -> float | None:
     text = line.decode("utf-8", errors="ignore").strip()
@@ -72,6 +87,33 @@ def _parse_sensor_value(line: bytes, mode: str) -> float | None:
         return None
 
 
+def _parse_sensor_values(line: bytes, mode: str) -> dict[str, float]:
+    text = line.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return {}
+
+    parsed_values: dict[str, float] = {}
+    channel_patterns = _SENSOR_CHANNEL_PATTERNS.get(mode, {})
+    for channel, pattern in channel_patterns.items():
+        match = pattern.search(text)
+        if match is None:
+            continue
+        try:
+            parsed_values[channel] = float(match.group(1))
+        except ValueError:
+            continue
+
+    if parsed_values:
+        return parsed_values
+
+    fallback_value = _parse_sensor_value(line, mode)
+    if fallback_value is None:
+        return {}
+
+    # Backward compatibility with single-sensor Arduino output without A0/A1 prefixes.
+    return {"a0": fallback_value}
+
+
 class SOFollower(Robot):
     """
     Generic SO follower base implementing common functionality for SO-100/101/10X.
@@ -85,12 +127,21 @@ class SOFollower(Robot):
         super().__init__(config)
         self.config = config
         self._sensor_serial = None
-        self._sensor_last_value = float(config.sensor_default_value)
+        self._sensor_last_values = {
+            "a0": float(config.sensor_default_value),
+            "a1": float(config.sensor_default_value),
+        }
 
         valid_modes = set(_SENSOR_VALUE_PATTERNS)
         if self.config.sensor_value_mode not in valid_modes:
             raise ValueError(
                 f"sensor_value_mode must be one of {sorted(valid_modes)}. Got '{self.config.sensor_value_mode}'."
+            )
+
+        valid_channels = {"a0", "a1", "both"}
+        if self.config.sensor_channel not in valid_channels:
+            raise ValueError(
+                f"sensor_channel must be one of {sorted(valid_channels)}. Got '{self.config.sensor_channel}'."
             )
 
         if self.config.sensor_enabled and not self.config.sensor_port:
@@ -125,7 +176,11 @@ class SOFollower(Robot):
     def observation_features(self) -> dict[str, type | tuple]:
         features = {**self._motors_ft, **self._cameras_ft}
         if self.config.sensor_enabled:
-            features[self.config.sensor_feature_name] = float
+            if self.config.sensor_channel == "both":
+                features[self.config.sensor_feature_name_a0] = float
+                features[self.config.sensor_feature_name_a1] = float
+            else:
+                features[self.config.sensor_feature_name] = float
         return features
 
     @cached_property
@@ -168,34 +223,35 @@ class SOFollower(Robot):
                 raise ConnectionError(msg) from exc
             logger.warning(msg)
 
-    def _read_sensor_value(self) -> float:
+    def _read_sensor_values(self) -> dict[str, float]:
         if not self.config.sensor_enabled or self._sensor_serial is None:
-            return self._sensor_last_value
+            return dict(self._sensor_last_values)
 
         try:
-            last_value = None
+            last_values = dict(self._sensor_last_values)
             while self._sensor_serial.in_waiting > 0:
                 line = self._sensor_serial.readline()
                 if not line:
                     break
-                parsed = _parse_sensor_value(line, self.config.sensor_value_mode)
-                if parsed is not None:
-                    last_value = parsed
+                parsed = _parse_sensor_values(line, self.config.sensor_value_mode)
+                if parsed:
+                    last_values.update(parsed)
 
-            if last_value is None:
+            if last_values == self._sensor_last_values:
                 line = self._sensor_serial.readline()
                 if line:
-                    last_value = _parse_sensor_value(line, self.config.sensor_value_mode)
+                    parsed = _parse_sensor_values(line, self.config.sensor_value_mode)
+                    if parsed:
+                        last_values.update(parsed)
 
-            if last_value is not None:
-                self._sensor_last_value = last_value
+            self._sensor_last_values = last_values
 
-            return self._sensor_last_value
+            return dict(self._sensor_last_values)
         except Exception as exc:
             if self.config.sensor_strict:
                 raise RuntimeError(f"Sensor read failed: {exc}") from exc
-            logger.debug("Optional sensor read failed (%s), reusing last value", exc)
-            return self._sensor_last_value
+            logger.debug("Optional sensor read failed (%s), reusing last values", exc)
+            return dict(self._sensor_last_values)
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -306,7 +362,14 @@ class SOFollower(Robot):
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
         if self.config.sensor_enabled:
-            obs_dict[self.config.sensor_feature_name] = self._read_sensor_value()
+            sensor_values = self._read_sensor_values()
+            if self.config.sensor_channel == "both":
+                obs_dict[self.config.sensor_feature_name_a0] = sensor_values["a0"]
+                obs_dict[self.config.sensor_feature_name_a1] = sensor_values["a1"]
+            elif self.config.sensor_channel == "a1":
+                obs_dict[self.config.sensor_feature_name] = sensor_values["a1"]
+            else:
+                obs_dict[self.config.sensor_feature_name] = sensor_values["a0"]
 
         return obs_dict
 

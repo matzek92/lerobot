@@ -92,6 +92,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
+                skip_video_decode_errors=cfg.dataset.skip_video_decode_errors,
                 return_uint8=True,
                 tolerance_s=cfg.tolerance_s,
             )

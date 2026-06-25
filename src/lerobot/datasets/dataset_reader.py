@@ -15,6 +15,7 @@
 # limitations under the License.
 """Private reader component for LeRobotDataset. Handles random-access reading (HF dataset, delta indices, video decoding)."""
 
+import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,7 +33,9 @@ from .io_utils import (
     hf_transform_to_torch,
     load_nested_dataset,
 )
-from .video_utils import decode_video_frames
+from .video_utils import FrameTimestampError, decode_video_frames
+
+logger = logging.getLogger(__name__)
 
 
 class DatasetReader:
@@ -50,6 +53,7 @@ class DatasetReader:
         video_backend: str,
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
+        skip_video_decode_errors: bool = False,
         return_uint8: bool = False,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
@@ -75,6 +79,7 @@ class DatasetReader:
         self._tolerance_s = tolerance_s
         self._video_backend = video_backend
         self._image_transforms = image_transforms
+        self._skip_video_decode_errors = skip_video_decode_errors
         self._return_uint8 = return_uint8
 
         self.hf_dataset: datasets.Dataset | None = None
@@ -261,7 +266,20 @@ class DatasetReader:
             futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
             return dict(f.result() for f in futures)
 
-    def get_item(self, idx) -> dict:
+    @staticmethod
+    def _is_video_decode_error(exc: Exception) -> bool:
+        if isinstance(exc, FrameTimestampError):
+            return True
+
+        msg = str(exc)
+        decode_error_markers = (
+            "Invalid data found when processing input",
+            "avcodec_send_packet",
+            "Could not push packet to decoder",
+        )
+        return any(marker in msg for marker in decode_error_markers)
+
+    def _get_item_once(self, idx) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
         ``idx`` is a *relative* index into the (possibly episode-filtered)
@@ -301,3 +319,42 @@ class DatasetReader:
             item["subtask"] = self._meta.subtasks.iloc[subtask_idx].name
 
         return item
+
+    def get_item(self, idx) -> dict:
+        if not self._skip_video_decode_errors:
+            return self._get_item_once(idx)
+
+        if self.hf_dataset is None:
+            raise RuntimeError("Dataset is not loaded. Call load_and_activate() before reading items.")
+
+        dataset_len = len(self.hf_dataset)
+        if dataset_len <= 0:
+            raise RuntimeError("Dataset is empty.")
+
+        max_attempts = min(dataset_len, 16)
+        current_idx = idx
+        last_exc: Exception | None = None
+
+        for attempt in range(max_attempts):
+            try:
+                return self._get_item_once(current_idx)
+            except Exception as exc:
+                if not self._is_video_decode_error(exc):
+                    raise
+
+                last_exc = exc
+                next_idx = (current_idx + 1) % dataset_len
+                logger.warning(
+                    "Video decode failed at sample idx=%s (%s). Skipping to idx=%s (%s/%s).",
+                    current_idx,
+                    exc,
+                    next_idx,
+                    attempt + 1,
+                    max_attempts,
+                )
+                current_idx = next_idx
+
+        raise RuntimeError(
+            "Exceeded max retry attempts while skipping video decode errors. "
+            "Last decode error preserved as cause."
+        ) from last_exc
