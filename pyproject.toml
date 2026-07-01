@@ -195,6 +195,16 @@ groot = [
 sarm = ["lerobot[transformers-dep]", "pydantic>=2.0.0,<3.0.0", "faker>=33.0.0,<35.0.0", "lerobot[matplotlib-dep]", "lerobot[qwen-vl-utils-dep]"]
 xvla = ["lerobot[transformers-dep]"]
 hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
+# Octo: JAX-based generalist robot policy from UC Berkeley.
+# JAX itself must be installed separately (CPU or GPU variant).
+# See: https://github.com/octo-models/octo for the full install recipe.
+octo = [
+    "octo @ git+https://github.com/octo-models/octo",
+    "jax>=0.4.20,<0.5.0",
+    "flax>=0.7.5,<0.8.0",
+    "orbax-checkpoint>=0.4.0,<0.7.0",
+    "tensorflow>=2.15.0,<3.0.0",
+]
 
 # Features
 async = ["lerobot[grpcio-dep]", "lerobot[matplotlib-dep]"]

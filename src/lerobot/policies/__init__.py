@@ -19,6 +19,7 @@ from .dot.configuration_dot import DOTConfig as DOTConfig
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
+from .octo.configuration_octo import OctoConfig as OctoConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
@@ -47,6 +48,7 @@ __all__ = [
     "DOTConfig",
     "GrootConfig",
     "MultiTaskDiTConfig",
+    "OctoConfig",
     "PI0Config",
     "PI0FastConfig",
     "PI05Config",
