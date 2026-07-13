@@ -119,6 +119,8 @@ class ACTPolicy(PreTrainedPolicy):
 
         # Gripper-movement-based dynamic recomputation: if the gripper state has changed significantly
         # since the last step, discard the remaining queued actions so the policy recomputes a fresh chunk.
+        # NOTE: The action queue is shared across all batch elements (in practice batch_size=1 at inference),
+        # so a gripper change detected in any batch element will trigger recomputation for the whole batch.
         if self.config.use_gripper_recompute and OBS_STATE in batch:
             current_gripper = batch[OBS_STATE][:, self.config.gripper_state_dim_idx]
             if self._prev_gripper_state is not None:

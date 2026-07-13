@@ -15,7 +15,9 @@
 # limitations under the License.
 """Tests for ACT gripper-movement-based dynamic recomputation."""
 
-from collections import deque
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +27,9 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
+if TYPE_CHECKING:
+    from lerobot.policies.act.modeling_act import ACTPolicy
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,14 +37,19 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
 
 def _make_config(
-    use_gripper_recompute: bool = True,
+    use_gripper_recompute: bool = True,  # enabled by default for convenience in tests
     gripper_state_dim_idx: int = -1,
     gripper_recompute_threshold: float = 0.05,
     n_action_steps: int = 5,
     chunk_size: int = 10,
     temporal_ensemble_coeff: float | None = None,
 ) -> ACTConfig:
-    """Return a minimal ACTConfig suitable for unit tests (state input, no images)."""
+    """Return a minimal ACTConfig suitable for unit tests (state input, no images).
+
+    Note: ``use_gripper_recompute`` defaults to ``True`` here (unlike the ``ACTConfig``
+    default of ``False``) so that most tests exercise the new feature without repeating
+    the flag every time.
+    """
     cfg = ACTConfig()
     cfg.input_features = {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
@@ -58,7 +68,7 @@ def _make_config(
     return cfg
 
 
-def _make_policy(cfg: ACTConfig):
+def _make_policy(cfg: ACTConfig) -> "ACTPolicy":
     """Return a lightweight stand-in for ACTPolicy that exercises only the queue logic."""
     from lerobot.policies.act.modeling_act import ACTPolicy
 
