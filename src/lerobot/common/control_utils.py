@@ -22,6 +22,7 @@ import traceback
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
+from queue import Queue
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -141,6 +142,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["episode_key_events"] = Queue()
 
     if is_headless():
         logging.warning(
@@ -165,6 +167,14 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording after current episode...")
                 events["stop_recording"] = True
                 events["exit_early"] = True  # Also break out of any active loop
+            else:
+                marker_key = None
+                if hasattr(key, "char") and key.char is not None:
+                    marker_key = key.char
+                elif hasattr(key, "name"):
+                    marker_key = f"<{key.name}>"
+                if marker_key is not None:
+                    events["episode_key_events"].put(marker_key)
         except Exception as e:
             print(f"Error handling key press: {e}")
 

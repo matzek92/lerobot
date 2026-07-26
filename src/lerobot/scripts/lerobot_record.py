@@ -77,6 +77,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
+from queue import Empty, Queue
 from typing import Any
 
 import torch
@@ -158,6 +159,23 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+EPISODE_KEY_MARKERS_FEATURE = "observation.episode_key_markers"
+
+
+def _consume_episode_key_markers(events: dict[str, Any]) -> str:
+    marker_queue = events.get("episode_key_events")
+    if not isinstance(marker_queue, Queue):
+        return ""
+
+    pressed_keys: list[str] = []
+    while True:
+        try:
+            pressed_keys.append(marker_queue.get_nowait())
+        except Empty:
+            break
+
+    return "|".join(pressed_keys)
 
 
 def _notify_zmq_cameras(robot: Robot, event_type: str) -> None:
@@ -693,6 +711,8 @@ def record_loop(
             if dataset is not None and is_record_frame:
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
+                if EPISODE_KEY_MARKERS_FEATURE in dataset.features:
+                    frame[EPISODE_KEY_MARKERS_FEATURE] = _consume_episode_key_markers(events)
                 dataset.add_frame(frame)
     
             if display_data:
@@ -765,6 +785,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=cfg.dataset.video,
         ),
+        {
+            EPISODE_KEY_MARKERS_FEATURE: {
+                "dtype": "string",
+                "shape": (1,),
+                "names": None,
+            }
+        },
     )
 
     dataset = None
@@ -794,6 +821,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if num_cameras > 0
                 else 0,
             )
+            if EPISODE_KEY_MARKERS_FEATURE not in dataset.features:
+                dataset_features.pop(EPISODE_KEY_MARKERS_FEATURE, None)
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             # Create empty dataset or load existing saved episodes

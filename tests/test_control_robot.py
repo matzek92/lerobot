@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from queue import Queue
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +23,12 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[hardware])")
 
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig, record
+from lerobot.scripts.lerobot_record import (
+    EPISODE_KEY_MARKERS_FEATURE,
+    DatasetRecordConfig,
+    RecordConfig,
+    record,
+)
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from tests.fixtures.constants import DUMMY_REPO_ID
@@ -126,3 +132,43 @@ def test_record_and_replay(tmp_path):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
+
+
+def test_record_saves_episode_key_markers(tmp_path):
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "record_with_markers",
+        num_episodes=1,
+        episode_time_s=0.1,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+
+    marker_events = Queue()
+    marker_events.put("1")
+    marker_events.put("a")
+    listener_events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "episode_key_events": marker_events,
+    }
+
+    with patch(
+        "lerobot.scripts.lerobot_record.init_keyboard_listener",
+        return_value=(None, listener_events),
+    ):
+        dataset = record(cfg)
+
+    assert EPISODE_KEY_MARKERS_FEATURE in dataset.meta.features
+    first_frame = dataset.hf_dataset[0]
+    assert first_frame["frame_index"] == 0
+    assert first_frame[EPISODE_KEY_MARKERS_FEATURE] == "1|a"
