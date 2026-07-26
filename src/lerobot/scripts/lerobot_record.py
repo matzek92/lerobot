@@ -169,6 +169,7 @@ def _consume_episode_key_markers(events: dict[str, Any]) -> str:
         return ""
 
     pressed_keys: list[str] = []
+    # Drain queue using get_nowait in a loop to avoid races between empty() and get().
     while True:
         try:
             pressed_keys.append(marker_queue.get_nowait())
