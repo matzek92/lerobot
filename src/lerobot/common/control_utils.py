@@ -169,11 +169,14 @@ def init_keyboard_listener():
                 events["exit_early"] = True  # Also break out of any active loop
             else:
                 marker_key = None
-                # Prefer .char for regular alphanumeric/symbol keys; fallback to .name for special keys.
-                if hasattr(key, "char") and key.char is not None:
+                # Record only printable non-whitespace character keys as episode markers.
+                if (
+                    hasattr(key, "char")
+                    and key.char is not None
+                    and key.char.isprintable()
+                    and not key.char.isspace()
+                ):
                     marker_key = key.char
-                elif hasattr(key, "name"):
-                    marker_key = f"<{key.name}>"
                 if marker_key is not None:
                     events["episode_key_events"].put(marker_key)
         except Exception as e:

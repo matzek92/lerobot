@@ -169,7 +169,7 @@ def _consume_episode_key_markers(events: dict[str, Any]) -> str:
         return ""
 
     pressed_keys: list[str] = []
-    # Drain queue using get_nowait in a loop to avoid races between empty() and get().
+    # Drain queue with get_nowait() directly so no check-then-get race can occur.
     while True:
         try:
             pressed_keys.append(marker_queue.get_nowait())
@@ -786,6 +786,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=cfg.dataset.video,
         ),
+        # Recording-only metadata feature: keys pressed between two saved frames in one episode.
         {
             EPISODE_KEY_MARKERS_FEATURE: {
                 "dtype": "string",
