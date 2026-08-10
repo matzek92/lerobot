@@ -38,6 +38,8 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
 
+PREV_REMAINING_TRAJ = "prev_remaining_traj"
+
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -96,6 +98,58 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._prev_action_chunk = None
+        self._prev_action_chunk_steps_consumed = 0
+
+    def _get_batch_source_tensor(self, batch: dict[str, Tensor], include_action: bool = False) -> Tensor:
+        if include_action and ACTION in batch:
+            return batch[ACTION]
+        if self.config.robot_state_feature:
+            return batch[OBS_STATE]
+        if self.config.env_state_feature:
+            return batch[OBS_ENV_STATE]
+        if OBS_IMAGES in batch:
+            return batch[OBS_IMAGES][0]
+        expected_keys = [OBS_STATE, OBS_ENV_STATE, OBS_IMAGES]
+        if include_action:
+            expected_keys.insert(0, ACTION)
+        raise AssertionError(f"Expected one of {expected_keys} in batch. Got keys: {sorted(batch.keys())}.")
+
+    def _get_batch_device_and_dtype(self, batch: dict[str, Tensor]) -> tuple[torch.device, torch.dtype]:
+        source_tensor = self._get_batch_source_tensor(batch)
+        return source_tensor.device, source_tensor.dtype
+
+    def _compute_remaining_action_chunk(self, action_chunk: Tensor, consumed_steps: int) -> Tensor:
+        assert action_chunk.ndim == 3, (
+            f"`action_chunk` is expected to have shape (batch, chunk_size, action_dim). Got {action_chunk.shape}."
+        )
+        assert action_chunk.shape[1] == self.config.chunk_size, (
+            f"`action_chunk.shape[1]` must match `chunk_size={self.config.chunk_size}`. "
+            f"Got {action_chunk.shape[1]}."
+        )
+        assert 0 <= consumed_steps <= self.config.chunk_size, (
+            f"`consumed_steps` must be in [0, {self.config.chunk_size}]. Got {consumed_steps}."
+        )
+
+        remaining = torch.zeros_like(action_chunk)
+        if consumed_steps < self.config.chunk_size:
+            n_remaining_steps = self.config.chunk_size - consumed_steps
+            remaining[:, :n_remaining_steps] = action_chunk[:, consumed_steps:]
+        return remaining
+
+    def _build_prev_remaining_traj(self, batch: dict[str, Tensor], consumed_steps: int) -> Tensor:
+        device, dtype = self._get_batch_device_and_dtype(batch)
+        batch_size = self._get_batch_source_tensor(batch, include_action=True).shape[0]
+        action_dim = self.config.action_feature.shape[0]
+        if (
+            self._prev_action_chunk is None
+            or self._prev_action_chunk.shape[0] != batch_size
+            or self._prev_action_chunk.shape[-1] != action_dim
+        ):
+            return torch.zeros((batch_size, self.config.chunk_size, action_dim), device=device, dtype=dtype)
+
+        prev_remaining = self._compute_remaining_action_chunk(self._prev_action_chunk, consumed_steps)
+        return prev_remaining.to(device=device, dtype=dtype)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -110,6 +164,10 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
+            if self.config.use_prev_remaining_traj:
+                self._prev_action_chunk_steps_consumed = min(
+                    self._prev_action_chunk_steps_consumed + 1, self.config.chunk_size
+                )
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
@@ -120,25 +178,48 @@ class ACTPolicy(PreTrainedPolicy):
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+        action = self._action_queue.popleft()
+        if self.config.use_prev_remaining_traj:
+            self._prev_action_chunk_steps_consumed = min(
+                self._prev_action_chunk_steps_consumed + 1, self.config.chunk_size
+            )
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
+        batch = dict(batch)  # shallow copy so that adding keys doesn't modify the original
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
+        if self.config.use_prev_remaining_traj:
+            batch[PREV_REMAINING_TRAJ] = self._build_prev_remaining_traj(
+                batch, consumed_steps=self._prev_action_chunk_steps_consumed
+            )
+
         actions = self.model(batch)[0]
+        if self.config.use_prev_remaining_traj:
+            self._prev_action_chunk = actions.detach()
+            self._prev_action_chunk_steps_consumed = 0
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        batch = dict(batch)  # shallow copy so that adding keys doesn't modify the original
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        if self.config.use_prev_remaining_traj:
+            prev_remaining = self._build_prev_remaining_traj(batch, consumed_steps=1)
+            with torch.no_grad():
+                warmup_batch = dict(batch)
+                warmup_batch[PREV_REMAINING_TRAJ] = prev_remaining
+                warmup_actions = self.model(warmup_batch)[0]
+            batch[PREV_REMAINING_TRAJ] = self._compute_remaining_action_chunk(
+                warmup_actions.detach(), consumed_steps=1
+            )
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -352,6 +433,10 @@ class ACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+        if self.config.use_prev_remaining_traj:
+            self.prev_remaining_action_input_proj = nn.Linear(
+                self.config.action_feature.shape[0], config.dim_model
+            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -497,6 +582,31 @@ class ACT(nn.Module):
             dtype=encoder_in_pos_embed.dtype,
             device=encoder_in_pos_embed.device,
         )
+        if self.config.use_prev_remaining_traj:
+            assert PREV_REMAINING_TRAJ in batch, (
+                f"`{PREV_REMAINING_TRAJ}` must be provided when `use_prev_remaining_traj=True`."
+            )
+            prev_remaining_traj = batch[PREV_REMAINING_TRAJ]
+            assert prev_remaining_traj.ndim == 3, (
+                f"`{PREV_REMAINING_TRAJ}` must have shape (batch, chunk_size, action_dim). "
+                f"Got {prev_remaining_traj.shape}."
+            )
+            assert prev_remaining_traj.shape[0] == batch_size, (
+                f"`{PREV_REMAINING_TRAJ}.shape[0]` must match batch size {batch_size}. "
+                f"Got {prev_remaining_traj.shape[0]}."
+            )
+            assert prev_remaining_traj.shape[1] == self.config.chunk_size, (
+                f"`{PREV_REMAINING_TRAJ}.shape[1]` must match `chunk_size={self.config.chunk_size}`. "
+                f"Got {prev_remaining_traj.shape[1]}."
+            )
+            assert prev_remaining_traj.shape[2] == self.config.action_feature.shape[0], (
+                f"`{PREV_REMAINING_TRAJ}.shape[2]` must match action dimension "
+                f"{self.config.action_feature.shape[0]}. Got {prev_remaining_traj.shape[2]}."
+            )
+            prev_remaining_traj_embed = self.prev_remaining_action_input_proj(
+                prev_remaining_traj.to(dtype=decoder_in.dtype)
+            ).transpose(0, 1)
+            decoder_in = decoder_in + prev_remaining_traj_embed
         decoder_out = self.decoder(
             decoder_in,
             encoder_out,

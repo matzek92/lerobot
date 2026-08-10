@@ -70,6 +70,12 @@ lerobot-train \
 2. **Training duration**: Expect a few hours for 100k training steps on a single GPU
 3. **Batch size**: Start with batch size 8 and adjust based on your GPU memory
 
+### Optional previous-remaining trajectory conditioning
+
+Set `--policy.use_prev_remaining_traj=true` to enable an ACT flavor that conditions decoding on the remaining
+trajectory from the previous prediction chunk. The first step (and steps after `policy.reset()`) uses an
+all-zero initializer for this extra input.
+
 ### Train using Google Colab
 
 If your local computer doesn't have a powerful GPU, you can utilize Google Colab to train your model by following the [ACT training notebook](./notebooks#training-act).
