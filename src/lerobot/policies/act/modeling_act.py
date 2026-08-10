@@ -96,6 +96,7 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._prev_gripper_state: Tensor | None = None
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -104,6 +105,10 @@ class ACTPolicy(PreTrainedPolicy):
         This method wraps `select_actions` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
+
+        When `use_gripper_recompute` is enabled, the queue is also cleared whenever the gripper state
+        changes by more than `gripper_recompute_threshold`, so the policy recomputes a fresh action chunk
+        and reacts promptly to gripper events (open/close transitions).
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
@@ -111,6 +116,18 @@ class ACTPolicy(PreTrainedPolicy):
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
+
+        # Gripper-movement-based dynamic recomputation: if the gripper state has changed significantly
+        # since the last step, discard the remaining queued actions so the policy recomputes a fresh chunk.
+        # NOTE: The action queue is shared across all batch elements (in practice batch_size=1 at inference),
+        # so a gripper change detected in any batch element will trigger recomputation for the whole batch.
+        if self.config.use_gripper_recompute and OBS_STATE in batch:
+            current_gripper = batch[OBS_STATE][:, self.config.gripper_state_dim_idx]
+            if self._prev_gripper_state is not None:
+                gripper_delta = (current_gripper - self._prev_gripper_state).abs().max()
+                if gripper_delta > self.config.gripper_recompute_threshold:
+                    self._action_queue.clear()
+            self._prev_gripper_state = current_gripper.clone()
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.

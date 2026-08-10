@@ -75,6 +75,15 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
+        use_gripper_recompute: Whether to enable gripper-movement-based dynamic recomputation. When True,
+            the action queue is cleared and the policy recomputes a fresh action chunk whenever the observed
+            gripper state changes by more than `gripper_recompute_threshold`. This allows the robot to react
+            quickly to gripper open/close events. Requires `observation.state` in `input_features`. Cannot
+            be combined with `temporal_ensemble_coeff` (which already recomputes every step).
+        gripper_state_dim_idx: Index of the gripper dimension in the observation state vector. Supports
+            Python-style negative indexing (e.g. -1 for the last element). Default is -1.
+        gripper_recompute_threshold: Absolute change in the (normalised) gripper state that triggers
+            recomputation of the action chunk. Default is 0.05.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -117,6 +126,13 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    # Gripper-movement-based dynamic recomputation. When enabled, the action queue is cleared whenever the
+    # gripper state changes by more than `gripper_recompute_threshold`, forcing the policy to recompute
+    # a fresh action chunk. This lets the robot react quickly to gripper events (open/close transitions).
+    # Requires `observation.state` to be present in `input_features`.
+    use_gripper_recompute: bool = False
+    gripper_state_dim_idx: int = -1
+    gripper_recompute_threshold: float = 0.05
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -149,6 +165,11 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.use_gripper_recompute and self.temporal_ensemble_coeff is not None:
+            raise ValueError(
+                "`use_gripper_recompute` cannot be combined with `temporal_ensemble_coeff`. "
+                "Temporal ensembling already recomputes the action chunk at every step."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -162,6 +183,10 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_gripper_recompute and not self.robot_state_feature:
+            raise ValueError(
+                "`use_gripper_recompute=True` requires `observation.state` to be present in `input_features`."
+            )
 
     @property
     def observation_delta_indices(self) -> None:
